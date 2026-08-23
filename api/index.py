@@ -7,16 +7,7 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration,
-    ApiClient,
-    MessagingApi
-)
-from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-    ImageMessageContent,
-    GroupSource,
-    RoomSource,
-    UserSource
+    ApiClient
 )
 
 # Load environment variables
@@ -25,87 +16,22 @@ load_dotenv()
 LINE_CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 
-app = FastAPI(title="LINE Webhook Receiver - Phase 1")
+app = FastAPI(title="LINE Webhook Receiver - Pure Raw Source")
 
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
     api_client = ApiClient(configuration)
-    messaging_api = MessagingApi(api_client)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
 else:
     print("Warning: LINE credentials not fully set in environment variables.")
     handler = None
-
-def get_sender_details(event):
-    source_type = event.source.type
-    group_id = None
-    user_id = getattr(event.source, "user_id", None) or "Unknown"
-    display_name = "Unknown User"
-
-    if isinstance(event.source, GroupSource):
-        group_id = event.source.group_id
-        if user_id != "Unknown" and messaging_api:
-            try:
-                profile = messaging_api.get_group_member_profile(group_id, user_id)
-                display_name = profile.display_name
-            except Exception as e:
-                print(f"Could not fetch group profile for {user_id}: {e}")
-    elif isinstance(event.source, RoomSource):
-        group_id = event.source.room_id
-        if user_id != "Unknown" and messaging_api:
-            try:
-                profile = messaging_api.get_room_member_profile(group_id, user_id)
-                display_name = profile.display_name
-            except Exception as e:
-                print(f"Could not fetch room profile for {user_id}: {e}")
-    elif isinstance(event.source, UserSource):
-        if user_id != "Unknown" and messaging_api:
-            try:
-                profile = messaging_api.get_profile(user_id)
-                display_name = profile.display_name
-            except Exception as e:
-                print(f"Could not fetch user profile for {user_id}: {e}")
-
-    return source_type, group_id, user_id, display_name
-
-def enrich_json_with_user_names(body_str: str) -> str:
-    """Parses raw LINE webhook JSON and inserts 'displayName' into source object for AI readiness."""
-    try:
-        data = json.loads(body_str)
-        events = data.get("events", [])
-        for event in events:
-            source = event.get("source", {})
-            user_id = source.get("userId")
-            source_type = source.get("type")
-            group_id = source.get("groupId") or source.get("roomId")
-
-            if user_id and messaging_api:
-                display_name = "Unknown User"
-                try:
-                    if source_type == "group" and group_id:
-                        profile = messaging_api.get_group_member_profile(group_id, user_id)
-                        display_name = profile.display_name
-                    elif source_type == "room" and group_id:
-                        profile = messaging_api.get_room_member_profile(group_id, user_id)
-                        display_name = profile.display_name
-                    else:
-                        profile = messaging_api.get_profile(user_id)
-                        display_name = profile.display_name
-                except Exception as e:
-                    print(f"Profile lookup failed for {user_id}: {e}")
-
-                source["displayName"] = display_name
-        return json.dumps(data, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error enriching JSON: {e}")
-        return body_str
 
 @app.get("/")
 @app.get("/api")
 async def root():
     return {
         "status": "online",
-        "phase": "Phase 1 - LINE Webhook Receiver",
+        "phase": "Phase 1 - Pure Raw Webhook Receiver",
         "message": "Vercel server is running cleanly!"
     }
 
@@ -121,9 +47,12 @@ async def callback(request: Request):
 
     body = (await request.body()).decode("utf-8")
 
-    # 🔥 Enrich JSON by inserting "displayName" directly into "source" for AI!
-    enriched_json = enrich_json_with_user_names(body)
-    print(f"[ENRICHED WEBHOOK JSON FOR AI]:\n{enriched_json}")
+    # 🔥 Pure Raw JSON Payload logging without external blocking API calls
+    try:
+        parsed_json = json.loads(body)
+        print(f"[RAW WEBHOOK JSON]:\n{json.dumps(parsed_json, indent=2, ensure_ascii=False)}")
+    except Exception:
+        print(f"[RAW WEBHOOK BODY]: {body}")
 
     try:
         handler.handle(body, signature)
@@ -134,22 +63,3 @@ async def callback(request: Request):
         print(f"Error handling webhook event: {e}")
 
     return "OK"
-
-# Event Handlers
-if handler:
-    @handler.add(MessageEvent, message=TextMessageContent)
-    def handle_text_message(event: MessageEvent):
-        source_type, group_id, user_id, display_name = get_sender_details(event)
-        text = event.message.text
-        message_id = event.message.id
-        quoted_msg_id = getattr(event.message, "quoted_message_id", None)
-
-        quote_info = f" | QuotedMsgID: {quoted_msg_id}" if quoted_msg_id else ""
-        print(f"[PARSED TEXT EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | MessageID: {message_id}{quote_info} | Message: {text}")
-
-    @handler.add(MessageEvent, message=ImageMessageContent)
-    def handle_image_message(event: MessageEvent):
-        source_type, group_id, user_id, display_name = get_sender_details(event)
-        message_id = event.message.id
-
-        print(f"[PARSED IMAGE EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | ImageMsgID: {message_id}")
