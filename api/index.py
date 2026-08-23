@@ -105,8 +105,10 @@ if handler:
         source_type, group_id, user_id, display_name = get_sender_details(event)
         text = event.message.text
         message_id = event.message.id
+        quoted_msg_id = getattr(event.message, "quoted_message_id", None)
 
-        print(f"[TEXT EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | Message: {text}")
+        quote_info = f" | QuotedMsgID: {quoted_msg_id}" if quoted_msg_id else ""
+        print(f"[TEXT EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | MessageID: {message_id}{quote_info} | Message: {text}")
 
     @handler.add(MessageEvent, message=ImageMessageContent)
     def handle_image_message(event: MessageEvent):
