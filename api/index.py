@@ -68,6 +68,38 @@ def get_sender_details(event):
 
     return source_type, group_id, user_id, display_name
 
+def enrich_json_with_user_names(body_str: str) -> str:
+    """Parses raw LINE webhook JSON and inserts 'displayName' into source object for AI readiness."""
+    try:
+        data = json.loads(body_str)
+        events = data.get("events", [])
+        for event in events:
+            source = event.get("source", {})
+            user_id = source.get("userId")
+            source_type = source.get("type")
+            group_id = source.get("groupId") or source.get("roomId")
+
+            if user_id and messaging_api:
+                display_name = "Unknown User"
+                try:
+                    if source_type == "group" and group_id:
+                        profile = messaging_api.get_group_member_profile(group_id, user_id)
+                        display_name = profile.display_name
+                    elif source_type == "room" and group_id:
+                        profile = messaging_api.get_room_member_profile(group_id, user_id)
+                        display_name = profile.display_name
+                    else:
+                        profile = messaging_api.get_profile(user_id)
+                        display_name = profile.display_name
+                except Exception as e:
+                    print(f"Profile lookup failed for {user_id}: {e}")
+
+                source["displayName"] = display_name
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error enriching JSON: {e}")
+        return body_str
+
 @app.get("/")
 @app.get("/api")
 async def root():
@@ -89,12 +121,9 @@ async def callback(request: Request):
 
     body = (await request.body()).decode("utf-8")
 
-    # 🔥 Print the entire raw JSON payload sent from LINE Platform
-    try:
-        parsed_json = json.loads(body)
-        print(f"[RAW WEBHOOK JSON]: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}")
-    except Exception:
-        print(f"[RAW WEBHOOK BODY]: {body}")
+    # 🔥 Enrich JSON by inserting "displayName" directly into "source" for AI!
+    enriched_json = enrich_json_with_user_names(body)
+    print(f"[ENRICHED WEBHOOK JSON FOR AI]:\n{enriched_json}")
 
     try:
         handler.handle(body, signature)
