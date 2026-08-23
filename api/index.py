@@ -1,4 +1,5 @@
 import os
+import json
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
@@ -88,6 +89,13 @@ async def callback(request: Request):
 
     body = (await request.body()).decode("utf-8")
 
+    # 🔥 Print the entire raw JSON payload sent from LINE Platform
+    try:
+        parsed_json = json.loads(body)
+        print(f"[RAW WEBHOOK JSON]: {json.dumps(parsed_json, indent=2, ensure_ascii=False)}")
+    except Exception:
+        print(f"[RAW WEBHOOK BODY]: {body}")
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -108,11 +116,11 @@ if handler:
         quoted_msg_id = getattr(event.message, "quoted_message_id", None)
 
         quote_info = f" | QuotedMsgID: {quoted_msg_id}" if quoted_msg_id else ""
-        print(f"[TEXT EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | MessageID: {message_id}{quote_info} | Message: {text}")
+        print(f"[PARSED TEXT EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | MessageID: {message_id}{quote_info} | Message: {text}")
 
     @handler.add(MessageEvent, message=ImageMessageContent)
     def handle_image_message(event: MessageEvent):
         source_type, group_id, user_id, display_name = get_sender_details(event)
         message_id = event.message.id
 
-        print(f"[IMAGE EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | ImageMsgID: {message_id}")
+        print(f"[PARSED IMAGE EVENT] Name: '{display_name}' (UserID: {user_id}) | GroupID: {group_id} | ImageMsgID: {message_id}")
