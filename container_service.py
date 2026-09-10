@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import base64
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -29,7 +30,6 @@ def analyze_images_with_gemini(image_bytes_list: list) -> str:
         return "⚠️ กรุณาตั้งค่า GEMINI_API_KEY ใน Environment Variables ก่อนใช้งานฟีเจอร์นี้ครับ"
 
     try:
-        import base64
         prompt = """คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจสอบตู้คอนเทนเนอร์และเอกสารขนส่งสินค้า (Logistics Container Inspector)
 
 โปรดวิเคราะห์รูปภาพตู้คอนเทนเนอร์, รูปเอกสาร EIR และรูปถ่ายลูกซีล (Bolt Seal) ที่ส่งมาทั้งหมดนี้ แล้วสกัดข้อมูล 5 ฟิลด์สำคัญออกมาอย่างแม่นยำที่สุด:
@@ -56,13 +56,17 @@ def analyze_images_with_gemini(image_bytes_list: list) -> str:
             })
         parts.append({"text": prompt})
 
-        # Try gemini-3.6-flash first, then fallback to gemini-3.5-flash
+        headers = {
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json"
+        }
+
         models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest"]
         last_err = None
 
         for model_name in models_to_try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-            res = requests.post(url, json={"contents": [{"parts": parts}]}, timeout=30)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            res = requests.post(url, json={"contents": [{"parts": parts}]}, headers=headers, timeout=45)
             if res.status_code == 200:
                 res_data = res.json()
                 try:
