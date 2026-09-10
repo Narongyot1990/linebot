@@ -30,20 +30,22 @@ def analyze_images_with_gemini(image_bytes_list: list) -> str:
         return "⚠️ กรุณาตั้งค่า GEMINI_API_KEY ใน Environment Variables ก่อนใช้งานฟีเจอร์นี้ครับ"
 
     try:
-        prompt = """คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจสอบตู้คอนเทนเนอร์และเอกสารขนส่งสินค้า (Logistics Container Inspector)
+        prompt = """คุณคือระบบสกัดข้อมูลตู้สินค้าอัตโนมัติ
 
-โปรดวิเคราะห์รูปภาพตู้คอนเทนเนอร์, รูปเอกสาร EIR และรูปถ่ายลูกซีล (Bolt Seal) ที่ส่งมาทั้งหมดนี้ แล้วสกัดข้อมูล 5 ฟิลด์สำคัญออกมาอย่างแม่นยำที่สุด:
+คำสั่งสำคัญอย่างเคร่งครัด:
+- **ห้ามมีคำเกริ่น ทักทาย หรืออารัมภบทเด็ดขาด** (เช่น ห้ามมีคำว่า 'เรียนผู้ใช้บริการ' หรือ 'นี่คือผลการวิเคราะห์')
+- ตอบกลับอย่างกระชับ สั้น ตรงประเด็น ทันที
+- หากพบข้อมูลไม่ตรงกัน (Mismatch) ให้ระบุเตือนสั้นๆ ในส่วนผลการตรวจสอบ
 
-1. 📋 Booking No. (หมายเลขจอง)
-2. 📦 Container No. (หมายเลขตู้คอนเทนเนอร์)
-3. 🔒 Seal No. (หมายเลขซีลตู้)
-4. ⚖️ Tare Weight (น้ำหนักตู้เปล่า)
-5. 📐 Container Size / Code (ขนาดและชนิดของตู้คอนเทนเนอร์ เช่น 40HC, 20GP)
+รูปแบบการตอบ (ตอบตามโครงสร้างนี้เท่านั้น):
 
-คำแนะนำการตอบ:
-- ให้ตอบกลับด้วยภาษาไทย จัดหมวดหมู่อ่านง่าย สวยงาม น่าอ่าน
-- หากฟิลด์ไหนอ่านไม่ออกหรือไม่ปรากฏในภาพ ให้ระบุว่า "ไม่ระบุในภาพ"
-- สรุปผลการตรวจสอบความถูกต้องให้ด้วยว่า เลขซีลและเลขตู้บนรูปภาพตรงกันหรือไม่"""
+📋 **Booking No.**: [ข้อมูล]
+📦 **Container No.**: [ข้อมูล]
+🔒 **Seal No.**: [ข้อมูล]
+⚖️ **Tare Weight**: [ข้อมูล]
+📐 **Size / Code**: [ข้อมูล]
+
+🔍 **ผลการตรวจสอบ**: [ตรงกันถูกต้อง / หรือแจ้งข้อพบบกพร่องสั้นๆ 1-2 บรรทัด]"""
 
         parts = []
         for img_bytes in image_bytes_list:
@@ -138,7 +140,7 @@ def handle_container_info_trigger(event):
         return
 
     analysis_result = analyze_images_with_gemini(image_bytes_list)
-    send_reply(event.reply_token, f"🤖 **[ผลสรุปข้อมูลตู้สินค้าโดย AI]**\n\n{analysis_result}")
+    send_reply(event.reply_token, f"🤖 **[ผลสรุปข้อมูลตู้สินค้า]**\n\n{analysis_result}")
 
 def send_reply(reply_token: str, text: str):
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
