@@ -33,19 +33,18 @@ def analyze_images_with_gemini(image_bytes_list: list) -> str:
         prompt = """คุณคือระบบสกัดข้อมูลตู้สินค้าอัตโนมัติ
 
 คำสั่งสำคัญอย่างเคร่งครัด:
-- **ห้ามมีคำเกริ่น ทักทาย หรืออารัมภบทเด็ดขาด** (เช่น ห้ามมีคำว่า 'เรียนผู้ใช้บริการ' หรือ 'นี่คือผลการวิเคราะห์')
-- ตอบกลับอย่างกระชับ สั้น ตรงประเด็น ทันที
-- หากพบข้อมูลไม่ตรงกัน (Mismatch) ให้ระบุเตือนสั้นๆ ในส่วนผลการตรวจสอบ
+- ตอบกลับเฉพาะโครงสร้างข้อความด้านล่างนี้เท่านั้น
+- ห้ามมีคำเกริ่น ห้ามทักทาย ห้ามมีคำอธิบายเพิ่มเติม ห้ามมีสัญลักษณ์หรือข้อความอื่นใดทั้งสิ้นนอกเหนือจากโครงสร้างนี้
+- หากฟิลด์ไหนอ่านไม่ออกหรือไม่มีในภาพ ให้ระบุว่า N/A
 
-รูปแบบการตอบ (ตอบตามโครงสร้างนี้เท่านั้น):
+รูปแบบที่ต้องตอบ (ตอบตามโครงสร้างนี้เป๊ะๆ เท่านั้น):
 
-📋 **Booking No.**: [ข้อมูล]
-📦 **Container No.**: [ข้อมูล]
-🔒 **Seal No.**: [ข้อมูล]
-⚖️ **Tare Weight**: [ข้อมูล]
-📐 **Size / Code**: [ข้อมูล]
-
-🔍 **ผลการตรวจสอบ**: [ตรงกันถูกต้อง / หรือแจ้งข้อพบบกพร่องสั้นๆ 1-2 บรรทัด]"""
+[Container information]
+Booking No: [ข้อมูล]
+Container No: [ข้อมูล]
+Seal No: [ข้อมูล]
+Tare Weight: [ข้อมูล]
+Size: [ข้อมูล]"""
 
         parts = []
         for img_bytes in image_bytes_list:
@@ -72,7 +71,7 @@ def analyze_images_with_gemini(image_bytes_list: list) -> str:
             if res.status_code == 200:
                 res_data = res.json()
                 try:
-                    text_result = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                    text_result = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
                     return text_result
                 except Exception as e:
                     last_err = f"Error parsing response: {e}"
@@ -140,7 +139,7 @@ def handle_container_info_trigger(event):
         return
 
     analysis_result = analyze_images_with_gemini(image_bytes_list)
-    send_reply(event.reply_token, f"🤖 **[ผลสรุปข้อมูลตู้สินค้า]**\n\n{analysis_result}")
+    send_reply(event.reply_token, analysis_result)
 
 def send_reply(reply_token: str, text: str):
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
