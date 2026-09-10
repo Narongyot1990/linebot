@@ -57,7 +57,7 @@ def get_source_details(event):
 async def root():
     return {
         "status": "online",
-        "phase": "Phase 2 - Webhook Receiver & MongoDB Atlas (Pure Text Storage)",
+        "phase": "Feature 1 - Container Info Extractor AI (/get_container_info)",
         "message": "Vercel server is running cleanly!"
     }
 
@@ -105,7 +105,7 @@ if handler:
                 source_type=source_type,
                 group_id=group_id,
                 user_id=user_id,
-                display_name="Unknown",  # Pure raw pass-through without blocking Profile API
+                display_name="Unknown",
                 message_id=message_id,
                 quoted_message_id=quoted_msg_id,
                 message_type="text",
@@ -114,6 +114,14 @@ if handler:
             )
         except Exception as e:
             print(f"Failed to record message in MongoDB: {e}")
+
+        # Trigger Feature 1: /get_container_info
+        if "/get_container_info" in text:
+            try:
+                import container_service
+                container_service.handle_container_info_trigger(event)
+            except Exception as ex:
+                print(f"[FEATURE 1 TRIGGER ERROR]: {ex}")
 
     @handler.add(MessageEvent, message=ImageMessageContent)
     def handle_image_message(event: MessageEvent):
