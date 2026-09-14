@@ -84,30 +84,42 @@ def parse_date_range(text: str):
         return None
 
     if len(args) >= 2:
-        start_date = parse_single_date(args[0])
-        end_date = parse_single_date(args[1])
+        target_start = parse_single_date(args[0])
+        target_end = parse_single_date(args[1])
     elif len(args) == 1:
-        start_date = parse_single_date(args[0])
-        end_date = start_date
+        target_start = parse_single_date(args[0])
+        target_end = target_start
 
-    if not start_date or not end_date:
-        start_date = today_th - timedelta(days=2)
-        end_date = today_th
+    if not target_start or not target_end:
+        target_start = today_th
+        target_end = today_th
         
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
+    if target_start > target_end:
+        target_start, target_end = target_end, target_start
 
-    start_th_dt = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0)
-    end_th_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
+    # Automatically search message history up to 2 days prior to target_start to catch advance dispatch notifications
+    hist_start = target_start - timedelta(days=2)
+    hist_end = target_end
+
+    hist_start_dt = datetime(hist_start.year, hist_start.month, hist_start.day, 0, 0, 0)
+    hist_end_dt = datetime(hist_end.year, hist_end.month, hist_end.day, 23, 59, 59)
     
-    start_utc_dt = start_th_dt - timedelta(hours=7)
-    end_utc_dt = end_th_dt - timedelta(hours=7)
-    
+    hist_start_utc = hist_start_dt - timedelta(hours=7)
+    hist_end_utc = hist_end_dt - timedelta(hours=7)
+
+    # Set of target delivery dates formatted as DD/MM/YYYY
+    target_date_set = set()
+    cur = target_start
+    while cur <= target_end:
+        target_date_set.add(cur.strftime("%d/%m/%Y"))
+        cur += timedelta(days=1)
+
     return (
-        start_utc_dt.isoformat(),
-        end_utc_dt.isoformat(),
-        start_date.strftime("%d/%m/%Y"),
-        end_date.strftime("%d/%m/%Y")
+        hist_start_utc.isoformat(),
+        hist_end_utc.isoformat(),
+        target_start.strftime("%d/%m/%Y"),
+        target_end.strftime("%d/%m/%Y"),
+        target_date_set
     )
 
 def classify_job_category(r: dict) -> str:
@@ -959,21 +971,22 @@ def handle_dispatch_report_trigger(event):
 
     use_ai = "ai" in cmd_lower.split()
 
-    start_utc_iso, end_utc_iso, start_th, end_th = parse_date_range(text)
+    hist_start_utc_iso, hist_end_utc_iso, start_th, end_th, target_date_set = parse_date_range(text)
+    date_display = start_th if start_th == end_th else f"{start_th} ถึง {end_th}"
     
     db = database.get_db()
     
     query = {
-        "timestamp": {"$gte": start_utc_iso, "$lte": end_utc_iso},
+        "timestamp": {"$gte": hist_start_utc_iso, "$lte": hist_end_utc_iso},
         "message_type": {"$in": ["text", "file"]}
     }
     
     docs = list(db.messages.find(query).sort("timestamp", 1))
     t_db = time.time()
-    print(f"[REPORT] DB query: {len(docs)} docs in {t_db - t0:.2f}s")
+    print(f"[REPORT] DB query: {len(docs)} docs in {t_db - t0:.2f}s (history window: {hist_start_utc_iso} to {hist_end_utc_iso})")
     
     if not docs:
-        send_reply_text(reply_token, f"ℹ️ ไม่พบบันทึกข้อความในช่วงวันที่ {start_th} ถึง {end_th} ในฐานข้อมูลครับ", quote_token=quote_token)
+        send_reply_text(reply_token, f"ℹ️ ไม่พบบันทึกข้อความสำหรับวันจัดส่ง {date_display} ในฐานข้อมูลครับ (ค้นหาประวัติย้อนหลัง 2 วันแล้ว)", quote_token=quote_token)
         return
 
     # Dispatchers across all groups:
@@ -1012,7 +1025,7 @@ def handle_dispatch_report_trigger(event):
             })
 
     if not selected_messages:
-        send_reply_text(reply_token, f"ℹ️ ไม่พบข้อความแจ้งงานในช่วง {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
+        send_reply_text(reply_token, f"ℹ️ ไม่พบข้อความแจ้งงานสำหรับวันจัดส่ง {date_display} ครับ", quote_token=quote_token)
         return
 
     print(f"[REPORT] Found {len(selected_messages)} dispatch messages across groups")
@@ -1027,15 +1040,19 @@ def handle_dispatch_report_trigger(event):
         records = extract_dispatch_records_regex(selected_messages, default_date=start_th)
     
     t_parse = time.time()
-    print(f"[REPORT] Parsed {len(records)} records in {t_parse - t_db:.3f}s ({'AI' if use_ai else 'REGEX'})")
+    print(f"[REPORT] Parsed {len(records)} raw records in {t_parse - t_db:.3f}s ({'AI' if use_ai else 'REGEX'})")
+
+    # 1. Filter strictly by Target Delivery Date(s)
+    records = [r for r in records if r.get("delivery_date") in target_date_set]
+    print(f"[REPORT] Filtered by delivery dates {target_date_set}: {len(records)} records remaining")
     
-    # Filter by category if requested (/report_fcl or /report_dom)
+    # 2. Filter by category if requested (/report_fcl or /report_dom)
     if target_category in ["FCL", "Domestics"]:
         records = [r for r in records if r.get("category") == target_category]
 
     if not records:
         cat_desc = f" [{target_category}]" if target_category != "ALL" else ""
-        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงาน{cat_desc} ในช่วง {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
+        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงาน{cat_desc} สำหรับวันจัดส่ง {date_display} ครับ\n(ค้นหาประวัติย้อนหลัง 2 วันแล้ว)", quote_token=quote_token)
         return
 
     # Build Flex Card Message
