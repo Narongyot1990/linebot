@@ -22,6 +22,7 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     FlexMessage,
     FlexContainer
@@ -176,18 +177,14 @@ def extract_dispatch_records_with_gemini(messages_text_list: list, default_date:
     }
     
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "temperature": 0.1
-        }
+        "contents": [{"parts": [{"text": prompt}]}]
     }
     
-    models_to_try = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"]
+    models_to_try = ["gemini-flash-latest", "gemini-3.7-flash"]
     for model_name in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=15)
+            res = requests.post(url, json=payload, headers=headers, timeout=25)
             if res.status_code == 200:
                 raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if raw_text.startswith("```json"):
@@ -489,24 +486,28 @@ def handle_dispatch_report_trigger(event):
         return
 
     bowie_user_ids = ["U4e8e9135b6578be52a8354f02cb9f127"]
-    relevant_texts = []
-    keywords = ["แจ้งงาน", "bkg", "booking", "job", "ตู้", "slot", "consol", "รับตู้", "ตัดหาง", "คืนตู้", "brose", "corbion", "purac", "exotic", "powertech", "uacj", "dts"]
+    keywords = ["แจ้งงาน", "bkg", "booking", "job", "ตู้", "slot", "consol", "รับตู้", "ตัดหาง", "คืนตู้", "brose", "corbion", "purac", "exotic", "powertech", "uacj", "dts", "cra", "tect", "homerich"]
     
+    selected_texts = []
+    seen = set()
     for d in docs:
         uid = d.get("user_id")
         dname = str(d.get("display_name", "")).lower()
-        c = d.get("content", "")
+        c = (d.get("content") or "").strip()
+        if not c or len(c) < 10:
+            continue
         is_bowie = (uid in bowie_user_ids) or ("bowie" in dname) or ("โบวี่" in dname)
         has_kw = any(k in c.lower() for k in keywords)
-        if is_bowie or has_kw:
-            relevant_texts.append(c)
+        if (is_bowie or has_kw) and c not in seen:
+            seen.add(c)
+            selected_texts.append(c[:280])
 
-    if not relevant_texts:
-        relevant_texts = [d.get("content", "") for d in docs if d.get("content")][:35]
+    if not selected_texts:
+        selected_texts = [d.get("content", "")[:280] for d in docs if d.get("content")][:15]
     else:
-        relevant_texts = relevant_texts[-35:]
+        selected_texts = selected_texts[-15:]
 
-    records = extract_dispatch_records_with_gemini(relevant_texts, default_date=start_th)
+    records = extract_dispatch_records_with_gemini(selected_texts, default_date=start_th)
     
     if not records:
         send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงานในช่วงวันที่ {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
@@ -542,20 +543,25 @@ def handle_dispatch_report_trigger(event):
         if not reply_messages:
             reply_messages.append(TextMessage(text=f"ℹ️ ประมวลผลเสร็จสิ้น พบ {len(records)} รายการ"))
 
+        source_id = getattr(getattr(event, "source", None), "group_id", None) or getattr(getattr(event, "source", None), "user_id", None)
         try:
             api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
                 messages=reply_messages
             ))
         except Exception as err:
-            print(f"[REPLY ERROR]: {err}. Trying text fallback.")
-            fallback_text = f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th}) รวม {len(records)} รายการ"
-            api.reply_message(ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=fallback_text)]
-            ))
+            print(f"[REPLY ERROR]: {err}. Trying push message fallback to {source_id}.")
+            if source_id:
+                try:
+                    api.push_message(PushMessageRequest(
+                        to=source_id,
+                        messages=reply_messages
+                    ))
+                    print(f"[PUSH SUCCESSFUL to {source_id}]")
+                except Exception as push_err:
+                    print(f"[PUSH ERROR]: {push_err}")
 
-def send_reply_text(reply_token: str, text: str, quote_token: str = None):
+def send_reply_text(reply_token: str, text: str, quote_token: str = None, source_id: str = None):
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
@@ -566,4 +572,12 @@ def send_reply_text(reply_token: str, text: str, quote_token: str = None):
             ))
         except Exception as e:
             print(f"[SEND TEXT ERROR]: {e}")
+            if source_id:
+                try:
+                    api.push_message(PushMessageRequest(
+                        to=source_id,
+                        messages=[TextMessage(text=text)]
+                    ))
+                except Exception as pe:
+                    print(f"[PUSH TEXT ERROR]: {pe}")
 
