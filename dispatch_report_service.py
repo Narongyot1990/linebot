@@ -183,11 +183,11 @@ def extract_dispatch_records_with_gemini(messages_text_list: list, default_date:
         }
     }
     
-    models_to_try = ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-flash-latest"]
+    models_to_try = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"]
     for model_name in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=60)
+            res = requests.post(url, json=payload, headers=headers, timeout=15)
             if res.status_code == 200:
                 raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if raw_text.startswith("```json"):
@@ -416,7 +416,7 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
     if not bubbles:
         return None
         
-    bubbles = bubbles[:10]  # Max 10 bubbles in carousel
+    bubbles = bubbles[:5]  # Max 5 bubbles in carousel to stay well below 25KB LINE payload limit
     
     if len(bubbles) == 1:
         return bubbles[0]
@@ -502,7 +502,9 @@ def handle_dispatch_report_trigger(event):
             relevant_texts.append(c)
 
     if not relevant_texts:
-        relevant_texts = [d.get("content", "") for d in docs if d.get("content")][:50]
+        relevant_texts = [d.get("content", "") for d in docs if d.get("content")][:35]
+    else:
+        relevant_texts = relevant_texts[-35:]
 
     records = extract_dispatch_records_with_gemini(relevant_texts, default_date=start_th)
     
