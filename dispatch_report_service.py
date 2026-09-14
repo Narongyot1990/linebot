@@ -45,7 +45,12 @@ def parse_date_range(text: str):
     today_th = now_th.date()
     
     parts = text.strip().split()
-    args = parts[1:]
+    non_date_keywords = {
+        "/report", "/report_fcl", "/report_dom", "/report_domestic",
+        "/dispatch_report", "/dispatch_report_fcl", "/dispatch_report_dom",
+        "fcl", "dom", "domestic", "ai", "csv"
+    }
+    args = [p for p in parts[1:] if p.lower() not in non_date_keywords]
     
     start_date = None
     end_date = None
@@ -105,8 +110,33 @@ def parse_date_range(text: str):
         end_date.strftime("%d/%m/%Y")
     )
 
+def classify_job_category(r: dict) -> str:
+    """Classifies a job record into 'FCL' (Container Import/Export) or 'Domestics'."""
+    con = str(r.get("container_no", "")).strip()
+    bkg = str(r.get("booking_no", "")).strip()
+    job_type = str(r.get("job_type", "")).lower()
+    cust = str(r.get("customer", "")).lower()
+    route = str(r.get("route", "")).lower()
+    note = str(r.get("status_note", "")).lower()
+
+    if con or bkg:
+        return "FCL"
+    
+    fcl_keywords = [
+        "ตู้", "ทอยตู้", "คืนตู้", "รับตู้", "ตัดหาง", "ผ่านท่า", "ลานดรอป", 
+        "เอเย่นต์", "fcl", "bkg", "booking", "ท่าเรือ", "ลาน", "jtc", "cpo", "yzz"
+    ]
+    if any(k in job_type or k in note or k in route for k in fcl_keywords):
+        return "FCL"
+
+    fcl_customers = ["purac", "corbion", "totalenergies", "hmm", "msk", "maersk", "oocl", "yangming", "zim"]
+    if any(k in cust for k in fcl_customers):
+        return "FCL"
+
+    return "Domestics"
+
 def sanitize_record(r: dict, default_date: str = "") -> dict:
-    """Cleans up raw AI extracted record to prevent None, null, or garbage values."""
+    """Cleans up raw extracted record and assigns category."""
     def clean_str(val):
         if val is None:
             return ""
@@ -125,8 +155,9 @@ def sanitize_record(r: dict, default_date: str = "") -> dict:
     driver = clean_str(r.get("driver_name")) or "-"
     plate = clean_str(r.get("license_plate"))
     note = clean_str(r.get("status_note"))
+    cat = clean_str(r.get("category"))
 
-    return {
+    record = {
         "delivery_date": del_date,
         "slot_time": slot_time,
         "customer": cust,
@@ -138,6 +169,8 @@ def sanitize_record(r: dict, default_date: str = "") -> dict:
         "license_plate": plate,
         "status_note": note
     }
+    record["category"] = cat if cat in ["FCL", "Domestics"] else classify_job_category(record)
+    return record
 
 # ============================================================
 # FAST REGEX-BASED DISPATCH PARSER (replaces slow Gemini call)
@@ -146,9 +179,12 @@ def sanitize_record(r: dict, default_date: str = "") -> dict:
 KNOWN_CUSTOMERS = {
     'brose': 'Brose', 'dts': 'DTS', 'exotic': 'Exotic Food',
     'uacj': 'UACJ', 'powertech': 'Powertech', 'siam': 'Siam Service-UACJ',
-    'corbion': 'Total Corbion', 'purac': 'Purac', 'homerich': 'Homerich (HRF)',
+    'corbion': 'Total Corbion', 'totalenergies': 'Total Corbion',
+    'purac': 'Purac', 'homerich': 'Homerich (HRF)', 'hrf': 'Homerich (HRF)',
     'cra': 'CRA', 'fscc': 'FSCC', 'zf': 'ZF', 'benz': 'Benz',
     'tect': 'TECT', 'sonic': 'Sonic', 'consol': 'Consol',
+    'ducati': 'Ducati', 'hmm': 'HMM', 'msk': 'Maersk (MSK)', 'maersk': 'Maersk (MSK)',
+    'oocl': 'OOCL', 'yangming': 'Yangming', 'one': 'ONE', 'zim': 'ZIM', 'ck line': 'CK Line',
 }
 
 def _extract_delivery_date(text: str) -> str:
@@ -431,21 +467,129 @@ def _parse_single_dispatch_message(text: str, default_date: str = "") -> list:
     return records
 
 
-def extract_dispatch_records_regex(bowie_messages: list, default_date: str = "") -> list:
+def _parse_prime_mover_message(text: str, default_date: str = "") -> list:
+    """Specialized parser for Prime Mover - FLS container dispatch messages (FCL)."""
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return []
+
+    # 1. Extract Drivers
+    drivers = []
+    plate = ""
+    for line in lines[:3]:
+        mentions = re.findall(r'@([^\s@]+(?:\s+[^\s@]+)*)', line)
+        for m in mentions:
+            cleaned = re.split(r'\s+(?:แจ้งงาน|ขับ|เอาตู้|ทะเบียน|งาน|เอารถ|ค้างหาง|วิ่ง)', m)[0].strip()
+            if cleaned and cleaned not in drivers and cleaned.lower() not in ['all', 'ทุกคน']:
+                drivers.append(cleaned)
+        plate_m = re.search(r'(\d{2,3}-\d{3,4})', line)
+        if plate_m:
+            plate = plate_m.group(1)
+
+    if not drivers:
+        return []
+
+    driver_str = ", ".join(drivers)
+    del_date = _extract_delivery_date(text) or default_date
+
+    # 2. Check for multi-jobs (*JOB 1*, *JOB 2*, etc.)
+    job_split = re.split(r'(?:\*?JOB\s*\d+\*?)', text, flags=re.IGNORECASE)
+    job_blocks = job_split[1:] if len(job_split) > 1 else [text]
+
+    records = []
+    for block in job_blocks:
+        bkg = ""
+        m_bkg = re.search(r'(?:BKG|Booking)\s*[:;]\s*([A-Za-z0-9]+)', block, re.IGNORECASE)
+        if m_bkg:
+            bkg = m_bkg.group(1)
+
+        con_no = ""
+        m_con = re.search(r'(?:เบอร์ตู้|ตู้)\s*[:;]\s*([A-Za-z]{4}\d{6,7})', block)
+        if m_con:
+            con_no = m_con.group(1)
+
+        cust = ""
+        for key, name in KNOWN_CUSTOMERS.items():
+            if key in block.lower():
+                cust = name
+                break
+        if not cust:
+            cust = "Total Corbion" if ("corbion" in block.lower() or "บิ๊กแบ็ค" in block) else "Prime Mover"
+
+        origin = ""
+        dest = ""
+        m_origin = re.search(r'(?:รับตู้(?:เปล่า)?|สถานที่รับตู้|ต้นทาง)\s*[:;]\s*(.+?)(?:\n|$)', block)
+        if m_origin:
+            origin = m_origin.group(1).strip()
+        m_dest = re.search(r'(?:ตัดหาง|สถานที่ส่ง|ปลายทาง)\s*[:;]\s*(.+?)(?:\n|$)', block)
+        if m_dest:
+            dest = m_dest.group(1).strip()
+            dest = re.sub(r'https?://\S+', '', dest).strip()
+
+        route = f"{origin} → {dest}" if origin and dest else (origin or dest or "-")
+
+        slot = "ตามคิว/รอแจ้ง"
+        m_slot = re.search(r'(?:เวลาเข้าโหลด|เวลา)\s*[:;]?\s*(\d{1,2}[.:]\d{2})', block)
+        if m_slot:
+            slot = m_slot.group(1).replace('.', ':') + " น."
+
+        job_type = "ทอยตู้เปล่า"
+        if "ตู้หนัก" in block:
+            job_type = "ตู้หนัก"
+        elif "ค้างหาง" in block:
+            job_type = "ทอยตู้ (ค้างหาง)"
+
+        m_vol = re.search(r'Volume\s*[:;]\s*([^\n]+)', block, re.IGNORECASE)
+        vol_note = m_vol.group(1).strip() if m_vol else ""
+
+        records.append(sanitize_record({
+            "category": "FCL",
+            "delivery_date": del_date,
+            "slot_time": slot,
+            "customer": cust,
+            "job_type": job_type,
+            "container_no": con_no,
+            "booking_no": bkg,
+            "route": route,
+            "driver_name": driver_str,
+            "license_plate": plate,
+            "status_note": vol_note
+        }, default_date=default_date))
+
+    return records
+
+
+def extract_dispatch_records_regex(messages: list, default_date: str = "") -> list:
     """
-    FAST regex-based parser for Bowie's dispatch messages.
-    Replaces Gemini AI call (~5-25s) with pure regex parsing (<100ms).
-    Only processes messages that look like dispatch assignments.
+    FAST regex-based parser for dispatch messages across groups.
+    Supports Prime Mover - FLS container jobs and FLS-CPO-CHONBURI jobs.
     """
     all_records = []
-    for msg_text in bowie_messages:
+    for item in messages:
+        if isinstance(item, dict):
+            msg_text = item.get("content", "")
+            gid = item.get("group_id", "")
+        else:
+            msg_text = str(item)
+            gid = ""
+
         msg_lower = msg_text.lower()
         has_dispatch_marker = any(kw in msg_lower for kw in [
-            'แจ้งงาน', 'ทะเบียน', 'ต้นทาง', 'ปลายทาง', 'เข้าหน้างาน'
+            'แจ้งงาน', 'ทะเบียน', 'ต้นทาง', 'ปลายทาง', 'เข้าหน้างาน', 'ตัดหาง', 'รับตู้', 'ทอยตู้', 'bkg', 'booking'
         ])
         if has_dispatch_marker and '@' in msg_text:
-            records = _parse_single_dispatch_message(msg_text, default_date)
+            is_prime_mover = (
+                gid == "C677f80c520f0f4559cd31efeed4f3915" or
+                ("bkg" in msg_lower and "ตัดหาง" in msg_lower) or
+                ("booking" in msg_lower and "volume" in msg_lower) or
+                ("ทอยตู้" in msg_lower and ("job 1" in msg_lower or "job 2" in msg_lower))
+            )
+            if is_prime_mover:
+                records = _parse_prime_mover_message(msg_text, default_date)
+            else:
+                records = _parse_single_dispatch_message(msg_text, default_date)
             all_records.extend(records)
+
     return all_records
 
 
@@ -513,7 +657,7 @@ def extract_dispatch_records_with_gemini(messages_text_list: list, default_date:
             
     return []
 
-def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
+def build_dispatch_flex_card(records: list, start_th: str, end_th: str, category_filter: str = "ALL"):
     """Builds a beautiful, modern LINE Flex Message (Card / Carousel) tailored for Operations Monitoring."""
     if not records:
         return None
@@ -539,6 +683,8 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
         assigned_drivers = [item for item in group_items if item.get("driver_name") and item.get("driver_name") not in ["-", "ยังไม่ระบุ พขร.", "Unknown"]]
         assigned_count = len(assigned_drivers)
         total_count = len(group_items)
+        fcl_count = sum(1 for item in group_items if item.get("category") == "FCL")
+        dom_count = sum(1 for item in group_items if item.get("category") == "Domestics")
 
         # Chunk items by 5 per bubble to keep UI clean and compact
         chunk_size = 5
@@ -549,9 +695,10 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
             
             job_boxes = []
             for j_idx, item in enumerate(chunk):
-                # Header row: Customer + Slot
+                # Header row: Category + Customer + Slot
                 slot_display = item['slot_time'] if item['slot_time'] else "ตามคิว/รอแจ้ง"
                 slot_color = "#0284C7" if ("น." in slot_display or ":" in slot_display) else "#64748B"
+                cat_label = item.get("category", "Domestics")
                 
                 top_row = {
                     "type": "box",
@@ -559,7 +706,7 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                     "contents": [
                         {
                             "type": "text",
-                            "text": f"{item['customer']}",
+                            "text": f"[{cat_label}] {item['customer']}",
                             "weight": "bold",
                             "size": "sm",
                             "color": "#0F172A",
@@ -678,6 +825,13 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                 }
                 job_boxes.append(job_card)
 
+            if category_filter == "FCL":
+                header_title = "🚚 สรุปการเดินรถ [FCL งานตู้]"
+            elif category_filter == "Domestics":
+                header_title = "🚚 สรุปการเดินรถ [Domestics ในประเทศ]"
+            else:
+                header_title = "🚚 สรุปการเดินรถและจ่ายงาน"
+
             bubble = {
                 "type": "bubble",
                 "size": "mega",
@@ -689,7 +843,7 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                     "contents": [
                         {
                             "type": "text",
-                            "text": "🚚 สรุปการเดินรถและจ่ายงาน",
+                            "text": header_title,
                             "weight": "bold",
                             "size": "md",
                             "color": "#38BDF8"
@@ -699,6 +853,13 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                             "text": f"📅 วันที่ส่งงาน: {date_key}{page_str} • รวม {total_count} งาน",
                             "size": "xs",
                             "color": "#94A3B8",
+                            "margin": "xs"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"📦 FCL: {fcl_count} • 🚛 Domestics: {dom_count}",
+                            "size": "xxs",
+                            "color": "#38BDF8",
                             "margin": "xs"
                         },
                         {
@@ -746,6 +907,7 @@ def format_records_to_csv(records: list) -> str:
     csv_output = io.StringIO()
     writer = csv.writer(csv_output)
     writer.writerow([
+        "Category",
         "Delivery_Date",
         "Slot_Plan_Time",
         "Customer",
@@ -760,6 +922,7 @@ def format_records_to_csv(records: list) -> str:
 
     for r in sorted_records:
         writer.writerow([
+            r.get("category", "Domestics"),
             r.get("delivery_date", ""),
             r.get("slot_time", ""),
             r.get("customer", ""),
@@ -775,7 +938,7 @@ def format_records_to_csv(records: list) -> str:
     return csv_output.getvalue().strip()
 
 def handle_dispatch_report_trigger(event):
-    """Main trigger handler for /report and /dispatch_report commands in LINE.
+    """Main trigger handler for /report, /report_fcl, /report_dom commands in LINE.
     Uses FAST regex parser by default. Gemini AI only via '/report ai ...'
     """
     import time
@@ -784,7 +947,17 @@ def handle_dispatch_report_trigger(event):
     text = getattr(event.message, "text", "").strip()
     reply_token = event.reply_token
     quote_token = getattr(event.message, "quote_token", None)
-    use_ai = "ai" in text.lower().split()  # /report ai today → use Gemini
+
+    cmd_lower = text.lower()
+    # Check category filter
+    if cmd_lower.startswith("/report_fcl") or cmd_lower.startswith("/dispatch_report_fcl") or " fcl" in cmd_lower:
+        target_category = "FCL"
+    elif cmd_lower.startswith("/report_dom") or cmd_lower.startswith("/report_domestic") or cmd_lower.startswith("/dispatch_report_dom") or " dom" in cmd_lower:
+        target_category = "Domestics"
+    else:
+        target_category = "ALL"
+
+    use_ai = "ai" in cmd_lower.split()
 
     start_utc_iso, end_utc_iso, start_th, end_th = parse_date_range(text)
     
@@ -803,51 +976,70 @@ def handle_dispatch_report_trigger(event):
         send_reply_text(reply_token, f"ℹ️ ไม่พบบันทึกข้อความในช่วงวันที่ {start_th} ถึง {end_th} ในฐานข้อมูลครับ", quote_token=quote_token)
         return
 
-    # Filter Bowie's dispatch messages
-    bowie_user_ids = ["U4e8e9135b6578be52a8354f02cb9f127"]
-    dispatch_keywords = ["แจ้งงาน", "ทะเบียน", "ต้นทาง", "ปลายทาง", "เข้าหน้างาน"]
+    # Dispatchers across all groups:
+    # 1. FLS Fame / Bowie 1 (FLS-CPO-CHONBURI, Trucking)
+    # 2. Bowie Nassama156 (Prime Mover - FLS)
+    # 3. Dispatcher_Beer
+    dispatcher_user_ids = [
+        "U4e8e9135b6578be52a8354f02cb9f127",
+        "Uc7c23d4cbde3b0f8cda6749c75695bce",
+        "U7c9ab68342d2be4803fab5199f2325e2"
+    ]
+    dispatch_groups = [
+        "C677f80c520f0f4559cd31efeed4f3915", # Prime Mover - FLS
+        "C9825ba54a13397c61a50f8bad3f1247e", # FLS-CPO-CHONBURI
+        "Cf1ae66792d1a4360e612816f7e16c8c0", # Trucking
+    ]
+    dispatch_keywords = ["แจ้งงาน", "ทะเบียน", "ต้นทาง", "ปลายทาง", "เข้าหน้างาน", "ตัดหาง", "รับตู้", "ทอยตู้", "booking", "bkg"]
     
-    bowie_dispatch_texts = []
+    selected_messages = []
     seen = set()
     for d in docs:
         uid = d.get("user_id")
+        gid = d.get("group_id")
         dname = str(d.get("display_name", "")).lower()
         c = (d.get("content") or "").strip()
         if not c or len(c) < 10:
             continue
-        is_bowie = (uid in bowie_user_ids) or ("bowie" in dname) or ("โบวี่" in dname)
-        if not is_bowie:
-            continue
+        is_dispatcher = (uid in dispatcher_user_ids) or ("bowie" in dname) or ("โบวี่" in dname)
+        in_target_group = (gid in dispatch_groups)
         has_dispatch = any(kw in c.lower() for kw in dispatch_keywords)
-        if has_dispatch and c not in seen:
+        if (is_dispatcher or in_target_group) and has_dispatch and c not in seen:
             seen.add(c)
-            bowie_dispatch_texts.append(c)  # Full text for regex (no truncation needed)
+            selected_messages.append({
+                "group_id": gid,
+                "content": c
+            })
 
-    if not bowie_dispatch_texts:
-        send_reply_text(reply_token, f"ℹ️ ไม่พบข้อความแจ้งงานจาก Bowie ในช่วง {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
+    if not selected_messages:
+        send_reply_text(reply_token, f"ℹ️ ไม่พบข้อความแจ้งงานในช่วง {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
         return
 
-    print(f"[REPORT] Found {len(bowie_dispatch_texts)} dispatch messages from Bowie")
+    print(f"[REPORT] Found {len(selected_messages)} dispatch messages across groups")
 
     # Parse dispatch records
     if use_ai:
-        # Explicit AI mode: /report ai today
         print("[REPORT] Using Gemini AI parser (user requested)")
-        selected = [t[:280] for t in bowie_dispatch_texts[-15:]]
-        records = extract_dispatch_records_with_gemini(selected, default_date=start_th)
+        raw_texts = [m["content"][:280] for m in selected_messages[-15:]]
+        records = extract_dispatch_records_with_gemini(raw_texts, default_date=start_th)
     else:
         # DEFAULT: Fast regex parser
-        records = extract_dispatch_records_regex(bowie_dispatch_texts, default_date=start_th)
+        records = extract_dispatch_records_regex(selected_messages, default_date=start_th)
     
     t_parse = time.time()
     print(f"[REPORT] Parsed {len(records)} records in {t_parse - t_db:.3f}s ({'AI' if use_ai else 'REGEX'})")
     
+    # Filter by category if requested (/report_fcl or /report_dom)
+    if target_category in ["FCL", "Domestics"]:
+        records = [r for r in records if r.get("category") == target_category]
+
     if not records:
-        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงานในช่วง {start_th} ถึง {end_th} ครับ\n(พบ {len(bowie_dispatch_texts)} ข้อความ แต่ไม่สามารถสกัดข้อมูลได้)", quote_token=quote_token)
+        cat_desc = f" [{target_category}]" if target_category != "ALL" else ""
+        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงาน{cat_desc} ในช่วง {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
         return
 
     # Build Flex Card Message
-    flex_dict = build_dispatch_flex_card(records, start_th, end_th)
+    flex_dict = build_dispatch_flex_card(records, start_th, end_th, category_filter=target_category)
     
     # Check if user explicitly asked for CSV format
     is_csv_requested = "csv" in text.lower()
@@ -866,7 +1058,8 @@ def handle_dispatch_report_trigger(event):
         elif flex_dict:
             try:
                 container = FlexContainer.from_dict(flex_dict)
-                flex_msg = FlexMessage(alt_text=f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th})", contents=container)
+                cat_desc = f" [{target_category}]" if target_category != "ALL" else ""
+                flex_msg = FlexMessage(alt_text=f"🚚 สรุปการเดินรถ{cat_desc} ({start_th} ถึง {end_th})", contents=container)
                 reply_messages.append(flex_msg)
             except Exception as e:
                 print(f"[FLEX CONTAINER ERROR]: {e}")
