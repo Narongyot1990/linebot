@@ -139,6 +139,316 @@ def sanitize_record(r: dict, default_date: str = "") -> dict:
         "status_note": note
     }
 
+# ============================================================
+# FAST REGEX-BASED DISPATCH PARSER (replaces slow Gemini call)
+# ============================================================
+
+KNOWN_CUSTOMERS = {
+    'brose': 'Brose', 'dts': 'DTS', 'exotic': 'Exotic Food',
+    'uacj': 'UACJ', 'powertech': 'Powertech', 'siam': 'Siam Service-UACJ',
+    'corbion': 'Total Corbion', 'purac': 'Purac', 'homerich': 'Homerich (HRF)',
+    'cra': 'CRA', 'fscc': 'FSCC', 'zf': 'ZF', 'benz': 'Benz',
+    'tect': 'TECT', 'sonic': 'Sonic', 'consol': 'Consol',
+}
+
+def _extract_delivery_date(text: str) -> str:
+    """Extract delivery date from message header (e.g., 'แจ้งงานพรุ่งนี้ 14/9/2026')."""
+    now_utc = datetime.now(timezone.utc)
+    now_th = now_utc + timedelta(hours=7)
+    today_th = now_th.date()
+
+    # Direct date pattern: DD/MM/YYYY or DD/M/YYYY
+    m = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', text)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        if y > 2500:
+            y -= 543
+        try:
+            return f"{d:02d}/{mo:02d}/{y}"
+        except Exception:
+            pass
+
+    # Relative date keywords
+    first_line = text.split('\n')[0].lower()
+    if 'วันนี้' in first_line:
+        return today_th.strftime("%d/%m/%Y")
+    if 'พรุ่งนี้' in first_line:
+        return (today_th + timedelta(days=1)).strftime("%d/%m/%Y")
+    if 'มะรืน' in first_line:
+        return (today_th + timedelta(days=2)).strftime("%d/%m/%Y")
+
+    return ""
+
+
+def _extract_customer(text: str) -> str:
+    """Extract customer name from message context using known customer list."""
+    lines = text.strip().split('\n')
+
+    # Check the first few non-header lines for customer name
+    for line in lines[1:5]:
+        line_s = line.strip()
+        if not line_s or line_s.startswith('@') or 'แจ้งงาน' in line_s:
+            continue
+        for key, name in KNOWN_CUSTOMERS.items():
+            if key in line_s.lower():
+                return line_s  # Return the full line as customer (more context)
+        # If the line looks like a customer name (short, no @ or ทะเบียน)
+        if len(line_s) < 50 and '@' not in line_s and 'ทะเบียน' not in line_s and 'ต้นทาง' not in line_s:
+            return line_s
+
+    # Fallback: search entire text for known customers
+    for key, name in KNOWN_CUSTOMERS.items():
+        if key in text.lower():
+            return name
+
+    return ""
+
+
+def _extract_driver_plate(line: str):
+    """Extract driver name and license plate from a line like '@Jack ทะเบียน 74-9822'."""
+    driver_name = ""
+    plate = ""
+
+    if 'ทะเบียน' in line and '@' in line:
+        before, after = line.split('ทะเบียน', 1)
+        # Find all @mentions in the before part
+        mentions = re.findall(r'@([^@]+)', before)
+        if mentions:
+            driver_name = mentions[-1].strip()
+        # Extract plate number
+        plate_m = re.search(r'(\d{2,3}-\d{3,4})', after)
+        if plate_m:
+            plate = plate_m.group(1)
+    elif '@' in line:
+        # No ทะเบียน, just @mention
+        mentions = re.findall(r'@([^@\s]+(?:\s+[^@\s]+)*)', line)
+        if mentions:
+            driver_name = mentions[-1].strip()
+
+    # Clean up driver name
+    driver_name = driver_name.strip().rstrip('.')
+    return driver_name, plate
+
+
+def _extract_route(text: str) -> str:
+    """Extract route from ต้นทาง/ปลายทาง or สถานที่รับ/ส่ง patterns."""
+    origin = ""
+    dest = ""
+
+    m_origin = re.search(r'ต้นทาง\s*:\s*(.+)', text)
+    if m_origin:
+        origin = m_origin.group(1).strip()
+
+    m_dest = re.search(r'ปลายทาง\s*:\s*(.+)', text)
+    if m_dest:
+        dest = m_dest.group(1).strip()
+
+    if not origin:
+        m_recv = re.search(r'สถานที่รับ(?:สินค้า)?\s*[:\s]\s*(.+)', text)
+        if m_recv:
+            origin = m_recv.group(1).strip()
+    if not dest:
+        m_send = re.search(r'สถานที่ส่ง(?:สินค้า)?\s*[:\s]\s*(.+)', text)
+        if m_send:
+            dest = m_send.group(1).strip()
+
+    if origin and dest:
+        return f"{origin} → {dest}"
+    if origin:
+        return origin
+    if dest:
+        return dest
+    return "-"
+
+
+def _extract_slot_time(text: str) -> str:
+    """Extract slot/plan time from text (e.g., 'เข้าหน้างาน 08.30 น.')."""
+    m = re.search(r'(\d{1,2}[.:]\d{2})\s*น\.', text)
+    if m:
+        return m.group(1).replace('.', ':') + " น."
+    m2 = re.search(r'เวลา\s*(\d{1,2}[.:]\d{2})', text)
+    if m2:
+        return m2.group(1).replace('.', ':') + " น."
+    return "ตามคิว/รอแจ้ง"
+
+
+def _extract_shift(lines: list, driver_line_idx: int) -> str:
+    """Look backwards from driver line to find shift marker (กะเช้า/กะดึก)."""
+    for i in range(driver_line_idx - 1, max(driver_line_idx - 5, -1), -1):
+        line = lines[i].strip().lower()
+        if 'กะเช้า' in line:
+            return "กะเช้า"
+        if 'กะดึก' in line:
+            return "กะดึก"
+        if 'กะบ่าย' in line:
+            return "กะบ่าย"
+    return ""
+
+
+def _extract_job_type(text: str) -> str:
+    """Extract job type (e.g., 'ขนแร็ค', 'WIP Single Trip')."""
+    m = re.search(r'วิ่งงาน\s*(.+?)(?:\n|$)', text)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r'งานขน(.+?)(?:\n|$)', text)
+    if m2:
+        return "ขน" + m2.group(1).strip()
+    for kw in ['ตู้หนัก', 'ตู้เปล่า', 'ชัทเทิล', 'ขนแร็ค', 'ทอยตู้', 'ตัดหาง', 'คืนตู้', 'รับตู้']:
+        if kw in text:
+            return kw
+    return ""
+
+
+def _extract_inline_note(line: str) -> str:
+    """Extract inline note from driver line (text after plate number)."""
+    if 'ทะเบียน' not in line:
+        return ""
+    _, after = line.split('ทะเบียน', 1)
+    after = re.sub(r'\s*\d{2,3}-\d{3,4}', '', after, count=1).strip()
+    after = re.sub(r'จำนวน\s*\d+\s*เที่ยว', '', after).strip()
+    paren = re.search(r'\((.+?)\)', after)
+    paren_note = paren.group(1) if paren else ""
+    after = re.sub(r'\(.+?\)', '', after).strip()
+    combined = (after + (" " + paren_note if paren_note else "")).strip()
+    return combined if len(combined) > 2 else ""
+
+
+def _extract_trips(line: str) -> str:
+    """Extract number of trips (จำนวน X เที่ยว)."""
+    m = re.search(r'จำนวน\s*(\d+)\s*เที่ยว', line)
+    return m.group(1) if m else ""
+
+
+def _parse_single_dispatch_message(text: str, default_date: str = "") -> list:
+    """Parse a single dispatch message from Bowie into structured records."""
+    text = text.strip()
+    if not text:
+        return []
+
+    lines = text.split('\n')
+
+    # 1. Extract delivery date
+    delivery_date = _extract_delivery_date(text) or default_date
+
+    # 2. Extract customer from context
+    customer = _extract_customer(text)
+
+    # 3. Find all driver assignment lines (lines with @ + ทะเบียน)
+    driver_line_indices = []
+    for i, line in enumerate(lines):
+        if 'ทะเบียน' in line and '@' in line:
+            driver_line_indices.append(i)
+
+    if not driver_line_indices:
+        return []
+
+    # 4. Check for multi-job pattern (งาน 1, งาน 2, ... under a single driver)
+    full_text_after_drivers = '\n'.join(lines[driver_line_indices[-1]:])
+    job_markers = list(re.finditer(r'งาน\s*(\d+)\s+(.+?)(?:\n|$)', full_text_after_drivers))
+
+    if len(job_markers) >= 2 and len(driver_line_indices) == 1:
+        # Multi-job pattern: one driver, multiple sub-jobs
+        driver_name, plate = _extract_driver_plate(lines[driver_line_indices[0]])
+        records = []
+        for j, jm in enumerate(job_markers):
+            start_pos = jm.start()
+            end_pos = job_markers[j + 1].start() if j + 1 < len(job_markers) else len(full_text_after_drivers)
+            sub_text = full_text_after_drivers[start_pos:end_pos]
+            sub_customer = jm.group(2).strip()
+            route = _extract_route(sub_text)
+            slot = _extract_slot_time(sub_text)
+            job_type = _extract_job_type(sub_text)
+            records.append(sanitize_record({
+                "delivery_date": delivery_date,
+                "customer": sub_customer or customer,
+                "driver_name": driver_name,
+                "license_plate": plate,
+                "route": route,
+                "slot_time": slot,
+                "job_type": job_type,
+                "container_no": "", "booking_no": "", "status_note": ""
+            }))
+        return records
+
+    # 5. Standard pattern: one record per driver line
+    shared_route = _extract_route(text)
+    shared_slot = _extract_slot_time(text)
+
+    records = []
+    for idx, dl_idx in enumerate(driver_line_indices):
+        line = lines[dl_idx]
+        driver_name, plate = _extract_driver_plate(line)
+
+        if not driver_name:
+            continue
+
+        # Determine this driver's section (from this line to the next driver line or end)
+        next_dl = driver_line_indices[idx + 1] if idx + 1 < len(driver_line_indices) else len(lines)
+        section_text = '\n'.join(lines[dl_idx:next_dl])
+
+        # Extract route and slot from this section
+        route = _extract_route(section_text)
+        slot = _extract_slot_time(section_text)
+        shift = _extract_shift(lines, dl_idx)
+
+        # If no specific route/slot found, use shared context
+        if route == "-":
+            route = shared_route
+        if slot == "ตามคิว/รอแจ้ง" and shift:
+            slot = shift
+        elif slot == "ตามคิว/รอแจ้ง":
+            slot = shared_slot
+
+        # Extract inline note and trips
+        note = _extract_inline_note(line)
+        trips = _extract_trips(line)
+        if trips:
+            note_parts = [f"จำนวน {trips} เที่ยว"]
+            if note:
+                note_parts.append(note)
+            if shift:
+                note_parts.append(shift)
+            note = " | ".join(note_parts)
+        elif shift and not note:
+            note = shift
+
+        job_type = _extract_job_type(section_text)
+
+        records.append(sanitize_record({
+            "delivery_date": delivery_date,
+            "customer": customer,
+            "driver_name": driver_name,
+            "license_plate": plate,
+            "route": route,
+            "slot_time": slot,
+            "job_type": job_type,
+            "container_no": "", "booking_no": "",
+            "status_note": note
+        }))
+
+    return records
+
+
+def extract_dispatch_records_regex(bowie_messages: list, default_date: str = "") -> list:
+    """
+    FAST regex-based parser for Bowie's dispatch messages.
+    Replaces Gemini AI call (~5-25s) with pure regex parsing (<100ms).
+    Only processes messages that look like dispatch assignments.
+    """
+    all_records = []
+    for msg_text in bowie_messages:
+        msg_lower = msg_text.lower()
+        has_dispatch_marker = any(kw in msg_lower for kw in [
+            'แจ้งงาน', 'ทะเบียน', 'ต้นทาง', 'ปลายทาง', 'เข้าหน้างาน'
+        ])
+        if has_dispatch_marker and '@' in msg_text:
+            records = _parse_single_dispatch_message(msg_text, default_date)
+            all_records.extend(records)
+    return all_records
+
+
 def extract_dispatch_records_with_gemini(messages_text_list: list, default_date: str = "") -> list:
     """Uses Gemini AI with strict JSON schema to parse raw LINE messages."""
     if not GEMINI_API_KEY:
@@ -465,10 +775,16 @@ def format_records_to_csv(records: list) -> str:
     return csv_output.getvalue().strip()
 
 def handle_dispatch_report_trigger(event):
-    """Main trigger handler for /report and /dispatch_report commands in LINE."""
+    """Main trigger handler for /report and /dispatch_report commands in LINE.
+    Uses FAST regex parser by default. Gemini AI only via '/report ai ...'
+    """
+    import time
+    t0 = time.time()
+    
     text = getattr(event.message, "text", "").strip()
     reply_token = event.reply_token
     quote_token = getattr(event.message, "quote_token", None)
+    use_ai = "ai" in text.lower().split()  # /report ai today → use Gemini
 
     start_utc_iso, end_utc_iso, start_th, end_th = parse_date_range(text)
     
@@ -480,15 +796,18 @@ def handle_dispatch_report_trigger(event):
     }
     
     docs = list(db.messages.find(query).sort("timestamp", 1))
+    t_db = time.time()
+    print(f"[REPORT] DB query: {len(docs)} docs in {t_db - t0:.2f}s")
     
     if not docs:
         send_reply_text(reply_token, f"ℹ️ ไม่พบบันทึกข้อความในช่วงวันที่ {start_th} ถึง {end_th} ในฐานข้อมูลครับ", quote_token=quote_token)
         return
 
+    # Filter Bowie's dispatch messages
     bowie_user_ids = ["U4e8e9135b6578be52a8354f02cb9f127"]
-    keywords = ["แจ้งงาน", "bkg", "booking", "job", "ตู้", "slot", "consol", "รับตู้", "ตัดหาง", "คืนตู้", "brose", "corbion", "purac", "exotic", "powertech", "uacj", "dts", "cra", "tect", "homerich"]
+    dispatch_keywords = ["แจ้งงาน", "ทะเบียน", "ต้นทาง", "ปลายทาง", "เข้าหน้างาน"]
     
-    selected_texts = []
+    bowie_dispatch_texts = []
     seen = set()
     for d in docs:
         uid = d.get("user_id")
@@ -497,26 +816,40 @@ def handle_dispatch_report_trigger(event):
         if not c or len(c) < 10:
             continue
         is_bowie = (uid in bowie_user_ids) or ("bowie" in dname) or ("โบวี่" in dname)
-        has_kw = any(k in c.lower() for k in keywords)
-        if (is_bowie or has_kw) and c not in seen:
+        if not is_bowie:
+            continue
+        has_dispatch = any(kw in c.lower() for kw in dispatch_keywords)
+        if has_dispatch and c not in seen:
             seen.add(c)
-            selected_texts.append(c[:280])
+            bowie_dispatch_texts.append(c)  # Full text for regex (no truncation needed)
 
-    if not selected_texts:
-        selected_texts = [d.get("content", "")[:280] for d in docs if d.get("content")][:15]
-    else:
-        selected_texts = selected_texts[-15:]
-
-    records = extract_dispatch_records_with_gemini(selected_texts, default_date=start_th)
-    
-    if not records:
-        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงานในช่วงวันที่ {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
+    if not bowie_dispatch_texts:
+        send_reply_text(reply_token, f"ℹ️ ไม่พบข้อความแจ้งงานจาก Bowie ในช่วง {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
         return
 
-    # 1. Build Flex Card Message
+    print(f"[REPORT] Found {len(bowie_dispatch_texts)} dispatch messages from Bowie")
+
+    # Parse dispatch records
+    if use_ai:
+        # Explicit AI mode: /report ai today
+        print("[REPORT] Using Gemini AI parser (user requested)")
+        selected = [t[:280] for t in bowie_dispatch_texts[-15:]]
+        records = extract_dispatch_records_with_gemini(selected, default_date=start_th)
+    else:
+        # DEFAULT: Fast regex parser
+        records = extract_dispatch_records_regex(bowie_dispatch_texts, default_date=start_th)
+    
+    t_parse = time.time()
+    print(f"[REPORT] Parsed {len(records)} records in {t_parse - t_db:.3f}s ({'AI' if use_ai else 'REGEX'})")
+    
+    if not records:
+        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงานในช่วง {start_th} ถึง {end_th} ครับ\n(พบ {len(bowie_dispatch_texts)} ข้อความ แต่ไม่สามารถสกัดข้อมูลได้)", quote_token=quote_token)
+        return
+
+    # Build Flex Card Message
     flex_dict = build_dispatch_flex_card(records, start_th, end_th)
     
-    # 2. Check if user explicitly asked for CSV format
+    # Check if user explicitly asked for CSV format
     is_csv_requested = "csv" in text.lower()
     csv_content = format_records_to_csv(records) if is_csv_requested else ""
     csv_block = f"📄 **[CSV DATA สำหรับนำเข้า Excel]**\n```csv\n{csv_content[:3500]}\n```" if csv_content else ""
@@ -549,6 +882,8 @@ def handle_dispatch_report_trigger(event):
                 reply_token=reply_token,
                 messages=reply_messages
             ))
+            t_reply = time.time()
+            print(f"[REPORT] ✅ Reply sent in {t_reply - t0:.2f}s total")
         except Exception as err:
             print(f"[REPLY ERROR]: {err}. Trying push message fallback to {source_id}.")
             if source_id:
