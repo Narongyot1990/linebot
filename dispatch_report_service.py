@@ -22,7 +22,9 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
-    TextMessage
+    TextMessage,
+    FlexMessage,
+    FlexContainer
 )
 
 def parse_date_range(text: str):
@@ -102,31 +104,66 @@ def parse_date_range(text: str):
         end_date.strftime("%d/%m/%Y")
     )
 
-def extract_dispatch_records_with_gemini(messages_text_list: list) -> list:
-    """Uses Gemini AI to parse raw LINE messages into structured JSON dispatch items."""
+def sanitize_record(r: dict, default_date: str = "") -> dict:
+    """Cleans up raw AI extracted record to prevent None, null, or garbage values."""
+    def clean_str(val):
+        if val is None:
+            return ""
+        s = str(val).strip()
+        if s.lower() in ["none", "null", "undefined", "-", "n/a", "ไม่มี"]:
+            return ""
+        return s
+
+    del_date = clean_str(r.get("delivery_date")) or default_date
+    slot_time = clean_str(r.get("slot_time")) or "ตามคิว/รอแจ้ง"
+    cust = clean_str(r.get("customer")) or "ไม่ระบุลูกค้า"
+    job_type = clean_str(r.get("job_type"))
+    con_no = clean_str(r.get("container_no"))
+    bkg_no = clean_str(r.get("booking_no"))
+    route = clean_str(r.get("route")) or "-"
+    driver = clean_str(r.get("driver_name")) or "-"
+    plate = clean_str(r.get("license_plate"))
+    note = clean_str(r.get("status_note"))
+
+    return {
+        "delivery_date": del_date,
+        "slot_time": slot_time,
+        "customer": cust,
+        "job_type": job_type,
+        "container_no": con_no,
+        "booking_no": bkg_no,
+        "route": route,
+        "driver_name": driver,
+        "license_plate": plate,
+        "status_note": note
+    }
+
+def extract_dispatch_records_with_gemini(messages_text_list: list, default_date: str = "") -> list:
+    """Uses Gemini AI with strict JSON schema to parse raw LINE messages."""
     if not GEMINI_API_KEY:
         return []
         
-    prompt = """คุณคือระบบ AI ผู้เชี่ยวชาญด้านการวิเคราะห์และสรุปงานขนส่ง (Transport Dispatching System)
-จงวิเคราะห์ข้อความแจ้งงานและพูดคุยการขนส่งต่อไปนี้ แล้วสกัดรายการงานขนส่งทั้งหมดออกมาเป็น JSON Array ตามโครงสร้างที่กำหนดอย่างเคร่งครัด:
+    prompt = """คุณคือระบบ AI วิเคราะห์และสกัดข้อมูลการจ่ายงานขนส่ง (Transport Dispatching System)
+วิเคราะห์ข้อความแจ้งงานและการประสานงานเดินรถต่อไปนี้ แล้วแปลงเป็น JSON Array ตาม schema นี้เท่านั้น:
 
-โครงสร้าง JSON ที่ต้องตอบ (ห้ามมีข้อความอื่นนอกจาก JSON Array):
 [
   {
-    "delivery_date": "DD/MM/YYYY (วันที่ต้องวิ่งงาน/ส่งงาน เช่น 14/09/2026)",
-    "slot_time": "เวลาเข้าโหลด/Plan Time เช่น 04:30 น., 11:00 น. หรือ 'ตามคิว/รอแจ้ง'",
-    "customer": "ชื่อลูกค้า/เจ้าของงาน เช่น Total Corbion, Purac, Brose, DTS, Exotic Food, Powertech, UACJ",
-    "job_type": "ประเภทงาน เช่น ตู้คอนเทนเนอร์, ชัทเทิล, แบตเตอรี่ (UN 3480), แร็ค, ทอยตู้เปล่า",
-    "container_no": "หมายเลขตู้ (ถ้ามี) เช่น FFAU7015469",
-    "booking_no": "หมายเลข Booking (ถ้ามี) เช่น 276771612",
-    "route": "เส้นทาง เช่น ลาน JTC 7 -> FLS ระยอง, Powertech -> Benz, Exotic ระยอง -> แหลมฉบัง",
-    "driver_name": "ชื่อ พขร./คนขับที่ได้รับมอบหมาย เช่น @Phornchai, @สมยศ, @NewZeaLand",
-    "license_plate": "ทะเบียนรถหัวหรือหาง (ถ้ามี) เช่น 75-0485, 700-4894",
-    "status_note": "หมายเหตุเพิ่มเติม (ถ้ามี)"
+    "delivery_date": "DD/MM/YYYY (วันที่ต้องวิ่งงาน เช่น 14/09/2026)",
+    "slot_time": "เวลาเข้าโหลด/Plan Time เช่น 04:30 น., 10:00 น. หรือถ้าไม่ระบุให้ใส่ 'ตามคิว/รอแจ้ง'",
+    "customer": "ชื่อลูกค้า เช่น Brose, DTS, Total Corbion, Purac, CRA / FSCC, Exotic Food, Homerich (HRF)",
+    "job_type": "ประเภทงาน เช่น ตู้หนัก, ตู้คอนเทนเนอร์ 20GP, ขนแร็ค, ชัทเทิล, ทอยตู้เปล่า",
+    "container_no": "หมายเลขตู้ (ถ้ามี) หรือเว้นว่าง string เปล่า",
+    "booking_no": "หมายเลข Booking (ถ้ามี) หรือเว้นว่าง string เปล่า",
+    "route": "เส้นทาง (ต้นทาง -> ปลายทาง)",
+    "driver_name": "ชื่อ พขร. ที่ได้รับมอบหมาย เช่น @Jack, @สมยศ",
+    "license_plate": "ทะเบียนรถ (ถ้ามี) เช่น 74-9822 หรือเว้นว่าง string เปล่า",
+    "status_note": "หมายเหตุหรือรายละเอียดเพิ่มเติม (ถ้ามี)"
   }
 ]
 
-ข้อความการทำงานทั้งหมด:
+ห้ามตอบเป็น markdown ข้อความอื่น ให้ตอบเฉพาะ JSON Array เท่านั้น
+
+ข้อความแจ้งงาน:
 """ + "\n---\n".join(messages_text_list)
 
     headers = {
@@ -134,11 +171,19 @@ def extract_dispatch_records_with_gemini(messages_text_list: list) -> list:
         "Content-Type": "application/json"
     }
     
-    models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest"]
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.1
+        }
+    }
+    
+    models_to_try = ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-flash-latest"]
     for model_name in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         try:
-            res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, headers=headers, timeout=60)
+            res = requests.post(url, json=payload, headers=headers, timeout=60)
             if res.status_code == 200:
                 raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if raw_text.startswith("```json"):
@@ -151,49 +196,222 @@ def extract_dispatch_records_with_gemini(messages_text_list: list) -> list:
                 
                 data = json.loads(raw_text)
                 if isinstance(data, list):
-                    return data
+                    return [sanitize_record(item, default_date) for item in data]
         except Exception as e:
             print(f"[GEMINI PARSING NOTICE with {model_name}]: {e}")
             
     return []
 
-def format_report_to_markdown_and_csv(records: list, start_th: str, end_th: str):
-    """Formats parsed records into Markdown tracking dashboard and standard CSV block."""
+def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
+    """Builds a beautiful, modern LINE Flex Message (Card / Carousel)."""
     if not records:
-        return (
-            f"ℹ️ ไม่พบข้อมูลการแจ้งงานในช่วงวันที่ {start_th} ถึง {end_th} ในระบบครับ",
-            ""
-        )
+        return None
 
+    # Sort records by delivery_date, customer, slot_time
     def sort_key(r):
         return (r.get("delivery_date", ""), r.get("customer", ""), r.get("slot_time", ""))
     
     sorted_records = sorted(records, key=sort_key)
 
-    md_lines = [
-        f"🚚 **[รายงานสรุปการเดินรถและจ่ายงาน]**",
-        f"📅 **ช่วงวันที่:** {start_th} ถึง {end_th} | **รวมทั้งหมด:** {len(sorted_records)} รายการ\n",
-        "| วันที่ส่งงาน | Slot/Plan Time | ลูกค้า | เบอร์ตู้ / Booking | เส้นทาง (ต้นทาง ➔ ปลายทาง) | พขร. | ทะเบียน |",
-        "| :---: | :---: | :--- | :--- | :--- | :--- | :---: |"
-    ]
-
+    # Group by delivery_date
+    date_groups = {}
     for r in sorted_records:
-        del_date = r.get("delivery_date", "-")
-        slot = r.get("slot_time", "-")
-        cust = r.get("customer", "-")
-        con = r.get("container_no", "")
-        bkg = r.get("booking_no", "")
-        con_bkg = f"`{con}`" if con else (f"BKG: {bkg}" if bkg else "-")
-        if con and bkg:
-            con_bkg = f"`{con}`<br><small>BKG: {bkg}</small>"
-            
-        route = r.get("route", "-")
-        driver = r.get("driver_name", "-")
-        plate = r.get("license_plate", "-")
-        
-        md_lines.append(f"| {del_date} | {slot} | **{cust}** | {con_bkg} | {route} | {driver} | {plate} |")
+        d = r.get("delivery_date") or start_th
+        if d not in date_groups:
+            date_groups[d] = []
+        date_groups[d].append(r)
 
-    markdown_text = "\n".join(md_lines)
+    bubbles = []
+    
+    for date_key, group_items in date_groups.items():
+        # Chunk items by 5 per bubble to keep UI clean and compact
+        chunk_size = 5
+        chunks = [group_items[i:i + chunk_size] for i in range(0, len(group_items), chunk_size)]
+        
+        for c_idx, chunk in enumerate(chunks):
+            page_str = f" ({c_idx+1}/{len(chunks)})" if len(chunks) > 1 else ""
+            
+            job_boxes = []
+            for j_idx, item in enumerate(chunk):
+                # Header row: Customer + Slot
+                top_row = {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"{item['customer']}",
+                            "weight": "bold",
+                            "size": "sm",
+                            "color": "#0F172A",
+                            "flex": 3,
+                            "wrap": True
+                        },
+                        {
+                            "type": "text",
+                            "text": f"⏰ {item['slot_time']}",
+                            "size": "xs",
+                            "color": "#0284C7",
+                            "align": "end",
+                            "weight": "bold",
+                            "flex": 2
+                        }
+                    ]
+                }
+                
+                # Container / Booking / Job Type
+                con_bkg_parts = []
+                if item["container_no"]:
+                    con_bkg_parts.append(f"ตู้: {item['container_no']}")
+                if item["booking_no"]:
+                    con_bkg_parts.append(f"BKG: {item['booking_no']}")
+                if item["job_type"] and not item["container_no"]:
+                    con_bkg_parts.append(item["job_type"])
+                
+                info_lines = [top_row]
+                
+                if con_bkg_parts:
+                    info_lines.append({
+                        "type": "box",
+                        "layout": "horizontal",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": f"📦 {' | '.join(con_bkg_parts)}",
+                                "size": "xs",
+                                "color": "#334155",
+                                "wrap": True
+                            }
+                        ]
+                    })
+                
+                # Route
+                info_lines.append({
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"📍 {item['route']}",
+                            "size": "xs",
+                            "color": "#475569",
+                            "wrap": True
+                        }
+                    ]
+                })
+                
+                # Driver + Plate
+                driver_contents = [
+                    {
+                        "type": "text",
+                        "text": f"👤 {item['driver_name']}",
+                        "size": "xs",
+                        "color": "#1E293B",
+                        "weight": "bold",
+                        "flex": 3,
+                        "wrap": True
+                    }
+                ]
+                if item["license_plate"]:
+                    driver_contents.append({
+                        "type": "text",
+                        "text": f"🚛 {item['license_plate']}",
+                        "size": "xs",
+                        "color": "#64748B",
+                        "align": "end",
+                        "flex": 2
+                    })
+                
+                info_lines.append({
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": driver_contents
+                })
+                
+                # Note
+                if item["status_note"]:
+                    info_lines.append({
+                        "type": "box",
+                        "layout": "horizontal",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": f"📝 {item['status_note']}",
+                                "size": "xxs",
+                                "color": "#64748B",
+                                "wrap": True
+                            }
+                        ]
+                    })
+                
+                job_card = {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#F8FAFC",
+                    "cornerRadius": "8px",
+                    "paddingAll": "10px",
+                    "spacing": "xs",
+                    "contents": info_lines
+                }
+                job_boxes.append(job_card)
+
+            bubble = {
+                "type": "bubble",
+                "size": "mega",
+                "header": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#0F172A",
+                    "paddingAll": "14px",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "🚚 สรุปการเดินรถและจ่ายงาน",
+                            "weight": "bold",
+                            "size": "md",
+                            "color": "#38BDF8"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"📅 วันที่: {date_key}{page_str} • รวม {len(group_items)} รายการ",
+                            "size": "xs",
+                            "color": "#94A3B8",
+                            "margin": "xs"
+                        }
+                    ]
+                },
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "paddingAll": "12px",
+                    "contents": job_boxes
+                }
+            }
+            bubbles.append(bubble)
+
+    if not bubbles:
+        return None
+        
+    bubbles = bubbles[:10]  # Max 10 bubbles in carousel
+    
+    if len(bubbles) == 1:
+        return bubbles[0]
+    else:
+        return {
+            "type": "carousel",
+            "contents": bubbles
+        }
+
+def format_records_to_csv(records: list) -> str:
+    """Generates standard RFC-compliant CSV string."""
+    if not records:
+        return ""
+        
+    def sort_key(r):
+        return (r.get("delivery_date", ""), r.get("customer", ""), r.get("slot_time", ""))
+    
+    sorted_records = sorted(records, key=sort_key)
 
     csv_output = io.StringIO()
     writer = csv.writer(csv_output)
@@ -224,8 +442,7 @@ def format_report_to_markdown_and_csv(records: list, start_th: str, end_th: str)
             r.get("status_note", "")
         ])
 
-    csv_text = csv_output.getvalue().strip()
-    return markdown_text, csv_text
+    return csv_output.getvalue().strip()
 
 def handle_dispatch_report_trigger(event):
     """Main trigger handler for /report and /dispatch_report commands in LINE."""
@@ -245,7 +462,7 @@ def handle_dispatch_report_trigger(event):
     docs = list(db.messages.find(query).sort("timestamp", 1))
     
     if not docs:
-        send_reply(reply_token, f"ℹ️ ไม่พบบันทึกข้อความในช่วงวันที่ {start_th} ถึง {end_th} ในฐานข้อมูลครับ", quote_token=quote_token)
+        send_reply_text(reply_token, f"ℹ️ ไม่พบบันทึกข้อความในช่วงวันที่ {start_th} ถึง {end_th} ในฐานข้อมูลครับ", quote_token=quote_token)
         return
 
     relevant_texts = []
@@ -259,51 +476,65 @@ def handle_dispatch_report_trigger(event):
     if not relevant_texts:
         relevant_texts = [d.get("content", "") for d in docs if d.get("content")][:50]
 
-    records = extract_dispatch_records_with_gemini(relevant_texts)
+    records = extract_dispatch_records_with_gemini(relevant_texts, default_date=start_th)
     
-    markdown_report, csv_content = format_report_to_markdown_and_csv(records, start_th, end_th)
+    if not records:
+        send_reply_text(reply_token, f"ℹ️ ไม่พบรายการแจ้งงานในช่วงวันที่ {start_th} ถึง {end_th} ครับ", quote_token=quote_token)
+        return
+
+    # 1. Build Flex Card Message
+    flex_dict = build_dispatch_flex_card(records, start_th, end_th)
     
-    messages_to_send = []
-    
-    if len(markdown_report) <= 4500:
-        messages_to_send.append(markdown_report)
-    else:
-        chunks = [markdown_report[i:i+4000] for i in range(0, len(markdown_report), 4000)]
-        messages_to_send.extend(chunks)
+    # 2. Build CSV Text Message
+    csv_content = format_records_to_csv(records)
+    csv_block = f"📄 **[CSV DATA สำหรับนำเข้า Excel]**\n```csv\n{csv_content[:3500]}\n```"
 
-    if csv_content:
-        csv_block = f"📄 **[CSV DATA สำหรับนำเข้า Excel]**\n```csv\n{csv_content[:3500]}\n```"
-        messages_to_send.append(csv_block)
-
-    send_reply_multi(reply_token, messages_to_send[:5], quote_token=quote_token)
-
-def send_reply(reply_token: str, text: str, quote_token: str = None):
-    send_reply_multi(reply_token, [text], quote_token=quote_token)
-
-def send_reply_multi(reply_token: str, text_list: list, quote_token: str = None):
+    # Send to LINE
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         
-        text_messages = []
-        for idx, t in enumerate(text_list):
-            if idx == 0 and quote_token:
-                try:
-                    text_messages.append(TextMessage(text=t, quote_token=quote_token))
-                    continue
-                except Exception:
-                    pass
-            text_messages.append(TextMessage(text=t))
+        reply_messages = []
+        
+        # Add Flex Message if valid
+        if flex_dict:
+            try:
+                container = FlexContainer.from_dict(flex_dict)
+                flex_msg = FlexMessage(alt_text=f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th})", contents=container)
+                reply_messages.append(flex_msg)
+            except Exception as e:
+                print(f"[FLEX CONTAINER ERROR]: {e}")
+                
+        # Add CSV text block as secondary bubble
+        if csv_content:
+            reply_messages.append(TextMessage(text=csv_block))
             
+        if not reply_messages:
+            reply_messages.append(TextMessage(text=f"ℹ️ ประมวลผลเสร็จสิ้น พบ {len(records)} รายการ"))
+
         try:
             api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=text_messages
+                messages=reply_messages
             ))
         except Exception as err:
-            print(f"[REPLY ERROR] Trying fallback without quote: {err}")
-            plain_msgs = [TextMessage(text=t) for t in text_list]
+            print(f"[REPLY ERROR]: {err}. Trying text fallback.")
+            # Fallback to plain text
+            fallback_text = f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th}) รวม {len(records)} รายการ\n\n" + csv_block
             api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=plain_msgs
+                messages=[TextMessage(text=fallback_text[:4500])]
             ))
+
+def send_reply_text(reply_token: str, text: str, quote_token: str = None):
+    configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        try:
+            api.reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)]
+            ))
+        except Exception as e:
+            print(f"[SEND TEXT ERROR]: {e}")
+
