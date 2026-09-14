@@ -123,6 +123,14 @@ if handler:
             except Exception as ex:
                 print(f"[FEATURE 1 TRIGGER ERROR]: {ex}")
 
+        # Trigger Feature 2: /report or /dispatch_report
+        elif text.strip().startswith("/report") or text.strip().startswith("/dispatch_report"):
+            try:
+                import dispatch_report_service
+                dispatch_report_service.handle_dispatch_report_trigger(event)
+            except Exception as ex:
+                print(f"[FEATURE 2 TRIGGER ERROR]: {ex}")
+
     @handler.add(MessageEvent, message=ImageMessageContent)
     def handle_image_message(event: MessageEvent):
         source_type, group_id, user_id = get_source_details(event)
