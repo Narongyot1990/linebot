@@ -123,28 +123,16 @@ def parse_date_range(text: str):
     )
 
 def classify_job_category(r: dict) -> str:
-    """Classifies a job record into 'FCL' (Container Import/Export) or 'Domestics'."""
+    """Classifies a job record into 'FCL' (Container Import/Export) or 'Domestics'.
+    STRICT RULE: FCL MUST be a container job with Booking No or Container No.
+    Everything else (e.g. Powertech, Brose, DTS, Exotic, Shuttle, Battery, Rack) is Domestics.
+    """
     con = str(r.get("container_no", "")).strip()
     bkg = str(r.get("booking_no", "")).strip()
-    job_type = str(r.get("job_type", "")).lower()
-    cust = str(r.get("customer", "")).lower()
-    route = str(r.get("route", "")).lower()
-    note = str(r.get("status_note", "")).lower()
 
     if con or bkg:
         return "FCL"
     
-    fcl_keywords = [
-        "ตู้", "ทอยตู้", "คืนตู้", "รับตู้", "ตัดหาง", "ผ่านท่า", "ลานดรอป", 
-        "เอเย่นต์", "fcl", "bkg", "booking", "ท่าเรือ", "ลาน", "jtc", "cpo", "yzz"
-    ]
-    if any(k in job_type or k in note or k in route for k in fcl_keywords):
-        return "FCL"
-
-    fcl_customers = ["purac", "corbion", "totalenergies", "hmm", "msk", "maersk", "oocl", "yangming", "zim"]
-    if any(k in cust for k in fcl_customers):
-        return "FCL"
-
     return "Domestics"
 
 def sanitize_record(r: dict, default_date: str = "") -> dict:
@@ -167,7 +155,6 @@ def sanitize_record(r: dict, default_date: str = "") -> dict:
     driver = clean_str(r.get("driver_name")) or "-"
     plate = clean_str(r.get("license_plate"))
     note = clean_str(r.get("status_note"))
-    cat = clean_str(r.get("category"))
 
     record = {
         "delivery_date": del_date,
@@ -181,7 +168,7 @@ def sanitize_record(r: dict, default_date: str = "") -> dict:
         "license_plate": plate,
         "status_note": note
     }
-    record["category"] = cat if cat in ["FCL", "Domestics"] else classify_job_category(record)
+    record["category"] = classify_job_category(record)
     return record
 
 # ============================================================
@@ -555,7 +542,6 @@ def _parse_prime_mover_message(text: str, default_date: str = "") -> list:
         vol_note = m_vol.group(1).strip() if m_vol else ""
 
         records.append(sanitize_record({
-            "category": "FCL",
             "delivery_date": del_date,
             "slot_time": slot,
             "customer": cust,
