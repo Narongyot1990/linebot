@@ -655,10 +655,44 @@ def extract_dispatch_records_with_gemini(messages_text_list: list, default_date:
             
     return []
 
+DEFAULT_DRIVER_AVATAR = "https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
+UNASSIGNED_AVATAR = "https://cdn-icons-png.flaticon.com/512/4812/4812244.png"
+
+def get_driver_avatar(driver_name: str, db=None) -> str:
+    """Finds real driver profile picture from MongoDB driver_cache or returns clean avatar."""
+    if not driver_name or driver_name in ["-", "ยังไม่ระบุ พขร.", "Unknown"]:
+        return UNASSIGNED_AVATAR
+    
+    clean_query = driver_name.replace('@', '').strip().lower()
+    first_token = clean_query.split()[0] if clean_query.split() else clean_query
+    
+    if db is not None:
+        try:
+            doc = db.driver_cache.find_one({
+                "display_name": {"$regex": re.escape(clean_query), "$options": "i"},
+                "picture_url": {"$exists": True, "$ne": ""}
+            })
+            if doc and doc.get("picture_url"):
+                return doc["picture_url"]
+                
+            if len(first_token) >= 3:
+                doc = db.driver_cache.find_one({
+                    "display_name": {"$regex": re.escape(first_token), "$options": "i"},
+                    "picture_url": {"$exists": True, "$ne": ""}
+                })
+                if doc and doc.get("picture_url"):
+                    return doc["picture_url"]
+        except Exception:
+            pass
+            
+    return DEFAULT_DRIVER_AVATAR
+
 def build_dispatch_flex_card(records: list, start_th: str, end_th: str, category_filter: str = "ALL"):
     """Builds a beautiful, modern LINE Flex Message (Card / Carousel) tailored for Operations Monitoring."""
     if not records:
         return None
+
+    db = database.get_db()
 
     # Sort records by delivery_date, customer, slot_time
     def sort_key(r):
@@ -693,10 +727,9 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str, category
             
             job_boxes = []
             for j_idx, item in enumerate(chunk):
-                # Header row: Category + Customer + Slot
+                # Header row: Customer + Slot (Clean, actual detail without redundant [FCL] text)
                 slot_display = item['slot_time'] if item['slot_time'] else "ตามคิว/รอแจ้ง"
                 slot_color = "#0284C7" if ("น." in slot_display or ":" in slot_display) else "#64748B"
-                cat_label = item.get("category", "Domestics")
                 
                 top_row = {
                     "type": "box",
@@ -704,7 +737,7 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str, category
                     "contents": [
                         {
                             "type": "text",
-                            "text": f"[{cat_label}] {item['customer']}",
+                            "text": item['customer'],
                             "weight": "bold",
                             "size": "sm",
                             "color": "#0F172A",
@@ -723,53 +756,63 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str, category
                     ]
                 }
                 
-                # Container / Booking / Job Type
-                con_bkg_parts = []
-                if item["container_no"]:
-                    con_bkg_parts.append(f"ตู้: {item['container_no']}")
+                # Actual Details: Booking / Container (FCL) or Job Type (Domestics)
+                detail_parts = []
                 if item["booking_no"]:
-                    con_bkg_parts.append(f"BKG: {item['booking_no']}")
-                if item["job_type"] and not item["container_no"]:
-                    con_bkg_parts.append(item["job_type"])
+                    detail_parts.append(f"BKG: {item['booking_no']}")
+                if item["container_no"]:
+                    detail_parts.append(f"ตู้: {item['container_no']}")
+                if not detail_parts and item["job_type"]:
+                    detail_parts.append(item["job_type"])
                 
                 info_lines = [top_row]
                 
-                if con_bkg_parts:
+                if detail_parts:
                     info_lines.append({
                         "type": "box",
                         "layout": "horizontal",
                         "contents": [
                             {
                                 "type": "text",
-                                "text": f"📦 {' | '.join(con_bkg_parts)}",
+                                "text": f"📦 {' • '.join(detail_parts)}" if item.get("category") == "FCL" else f"🚛 {' • '.join(detail_parts)}",
                                 "size": "xs",
-                                "color": "#334155",
+                                "color": "#0369A1" if item.get("category") == "FCL" else "#475569",
+                                "weight": "bold" if item.get("category") == "FCL" else "regular",
                                 "wrap": True
                             }
                         ]
                     })
                 
                 # Route
-                info_lines.append({
-                    "type": "box",
-                    "layout": "horizontal",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": f"📍 {item['route']}",
-                            "size": "xs",
-                            "color": "#475569",
-                            "wrap": True
-                        }
-                    ]
-                })
+                if item["route"] and item["route"] != "-":
+                    info_lines.append({
+                        "type": "box",
+                        "layout": "horizontal",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": f"📍 {item['route']}",
+                                "size": "xs",
+                                "color": "#475569",
+                                "wrap": True
+                            }
+                        ]
+                    })
                 
-                # Driver + Plate (with assignment visual check)
+                # Driver Row with REAL PROFILE AVATAR IMAGE
                 is_driver_assigned = bool(item['driver_name'] and item['driver_name'] not in ["-", "ยังไม่ระบุ พขร."])
-                driver_text = f"👤 {item['driver_name']}" if is_driver_assigned else "👤 ⚠️ ยังไม่ระบุ พขร."
-                driver_color = "#1E293B" if is_driver_assigned else "#D97706"
+                driver_text = item['driver_name'] if is_driver_assigned else "ยังไม่ระบุ พขร."
+                driver_color = "#0F172A" if is_driver_assigned else "#D97706"
+                avatar_url = get_driver_avatar(item['driver_name'], db)
                 
                 driver_contents = [
+                    {
+                        "type": "image",
+                        "url": avatar_url,
+                        "size": "xxs",
+                        "aspectRatio": "1:1",
+                        "aspectMode": "cover"
+                    },
                     {
                         "type": "text",
                         "text": driver_text,
@@ -793,6 +836,8 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str, category
                 info_lines.append({
                     "type": "box",
                     "layout": "horizontal",
+                    "alignItems": "center",
+                    "spacing": "sm",
                     "contents": driver_contents
                 })
                 
