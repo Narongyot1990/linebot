@@ -144,13 +144,17 @@ def extract_dispatch_records_with_gemini(messages_text_list: list, default_date:
         return []
         
     prompt = """คุณคือระบบ AI วิเคราะห์และสกัดข้อมูลการจ่ายงานขนส่ง (Transport Dispatching System)
-วิเคราะห์ข้อความแจ้งงานและการประสานงานเดินรถต่อไปนี้ แล้วแปลงเป็น JSON Array ตาม schema นี้เท่านั้น:
+วิเคราะห์ข้อความแจ้งงานจากผู้จ่ายงาน (Bowie / ผู้ควบคุมรถ) ต่อไปนี้
+
+หน้าที่สำคัญที่สุด:
+1. สกัด "วันที่ส่งงาน/วิ่งงานจริง (delivery_date)" จากในเนื้อหาข้อความ (เช่น ในข้อความระบุว่า "งานวันที่ 14", "งานวันจันทร์ที่ 14/09", "วิ่งงาน 14/09" ให้แปลงเป็นวันที่ DD/MM/YYYY ให้ถูกต้อง เช่น 14/09/2026 แม้ข้อความจะถูกส่งในประวัติวันที่ 12 หรือ 13 ก็ตาม)
+2. สกัดข้อมูลงานแต่ละรายการออกมาเป็น JSON Array ตาม schema นี้เท่านั้น:
 
 [
   {
-    "delivery_date": "DD/MM/YYYY (วันที่ต้องวิ่งงาน เช่น 14/09/2026)",
-    "slot_time": "เวลาเข้าโหลด/Plan Time เช่น 04:30 น., 10:00 น. หรือถ้าไม่ระบุให้ใส่ 'ตามคิว/รอแจ้ง'",
-    "customer": "ชื่อลูกค้า เช่น Brose, DTS, Total Corbion, Purac, CRA / FSCC, Exotic Food, Homerich (HRF)",
+    "delivery_date": "DD/MM/YYYY (วันที่ต้องวิ่งงานจริงที่ระบุในข้อความ เช่น 14/09/2026 หรือถ้าไม่ระบุให้ใส่ 'ตามคิว/รอแจ้ง')",
+    "slot_time": "เวลาเข้าโหลด/Plan Time เช่น 04:30 น., 10:00 น., 13:00 น. หรือถ้าไม่ระบุให้ใส่ 'ตามคิว/รอแจ้ง'",
+    "customer": "ชื่อลูกค้า เช่น Brose, DTS, Total Corbion, Purac, CRA / FSCC, Exotic Food, Homerich (HRF), Powertech, UACJ",
     "job_type": "ประเภทงาน เช่น ตู้หนัก, ตู้คอนเทนเนอร์ 20GP, ขนแร็ค, ชัทเทิล, ทอยตู้เปล่า",
     "container_no": "หมายเลขตู้ (ถ้ามี) หรือเว้นว่าง string เปล่า",
     "booking_no": "หมายเลข Booking (ถ้ามี) หรือเว้นว่าง string เปล่า",
@@ -203,7 +207,7 @@ def extract_dispatch_records_with_gemini(messages_text_list: list, default_date:
     return []
 
 def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
-    """Builds a beautiful, modern LINE Flex Message (Card / Carousel)."""
+    """Builds a beautiful, modern LINE Flex Message (Card / Carousel) tailored for Operations Monitoring."""
     if not records:
         return None
 
@@ -213,10 +217,10 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
     
     sorted_records = sorted(records, key=sort_key)
 
-    # Group by delivery_date
+    # Group by delivery_date (วันที่ส่งงานจริง)
     date_groups = {}
     for r in sorted_records:
-        d = r.get("delivery_date") or start_th
+        d = r.get("delivery_date") or "ตามคิว/รอแจ้ง"
         if d not in date_groups:
             date_groups[d] = []
         date_groups[d].append(r)
@@ -224,6 +228,11 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
     bubbles = []
     
     for date_key, group_items in date_groups.items():
+        # Calculate summary metrics for operations monitoring
+        assigned_drivers = [item for item in group_items if item.get("driver_name") and item.get("driver_name") not in ["-", "ยังไม่ระบุ พขร.", "Unknown"]]
+        assigned_count = len(assigned_drivers)
+        total_count = len(group_items)
+
         # Chunk items by 5 per bubble to keep UI clean and compact
         chunk_size = 5
         chunks = [group_items[i:i + chunk_size] for i in range(0, len(group_items), chunk_size)]
@@ -234,6 +243,9 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
             job_boxes = []
             for j_idx, item in enumerate(chunk):
                 # Header row: Customer + Slot
+                slot_display = item['slot_time'] if item['slot_time'] else "ตามคิว/รอแจ้ง"
+                slot_color = "#0284C7" if ("น." in slot_display or ":" in slot_display) else "#64748B"
+                
                 top_row = {
                     "type": "box",
                     "layout": "horizontal",
@@ -249,9 +261,9 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                         },
                         {
                             "type": "text",
-                            "text": f"⏰ {item['slot_time']}",
+                            "text": f"⏰ {slot_display}",
                             "size": "xs",
-                            "color": "#0284C7",
+                            "color": slot_color,
                             "align": "end",
                             "weight": "bold",
                             "flex": 2
@@ -300,13 +312,17 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                     ]
                 })
                 
-                # Driver + Plate
+                # Driver + Plate (with assignment visual check)
+                is_driver_assigned = bool(item['driver_name'] and item['driver_name'] not in ["-", "ยังไม่ระบุ พขร."])
+                driver_text = f"👤 {item['driver_name']}" if is_driver_assigned else "👤 ⚠️ ยังไม่ระบุ พขร."
+                driver_color = "#1E293B" if is_driver_assigned else "#D97706"
+                
                 driver_contents = [
                     {
                         "type": "text",
-                        "text": f"👤 {item['driver_name']}",
+                        "text": driver_text,
                         "size": "xs",
-                        "color": "#1E293B",
+                        "color": driver_color,
                         "weight": "bold",
                         "flex": 3,
                         "wrap": True
@@ -373,9 +389,16 @@ def build_dispatch_flex_card(records: list, start_th: str, end_th: str):
                         },
                         {
                             "type": "text",
-                            "text": f"📅 วันที่: {date_key}{page_str} • รวม {len(group_items)} รายการ",
+                            "text": f"📅 วันที่ส่งงาน: {date_key}{page_str} • รวม {total_count} งาน",
                             "size": "xs",
                             "color": "#94A3B8",
+                            "margin": "xs"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"👤 มอบหมาย พขร. แล้ว: {assigned_count}/{total_count} คัน",
+                            "size": "xxs",
+                            "color": "#38BDF8" if assigned_count == total_count else "#FBBF24",
                             "margin": "xs"
                         }
                     ]
@@ -465,12 +488,17 @@ def handle_dispatch_report_trigger(event):
         send_reply_text(reply_token, f"ℹ️ ไม่พบบันทึกข้อความในช่วงวันที่ {start_th} ถึง {end_th} ในฐานข้อมูลครับ", quote_token=quote_token)
         return
 
+    bowie_user_ids = ["U4e8e9135b6578be52a8354f02cb9f127"]
     relevant_texts = []
     keywords = ["แจ้งงาน", "bkg", "booking", "job", "ตู้", "slot", "consol", "รับตู้", "ตัดหาง", "คืนตู้", "brose", "corbion", "purac", "exotic", "powertech", "uacj", "dts"]
     
     for d in docs:
+        uid = d.get("user_id")
+        dname = str(d.get("display_name", "")).lower()
         c = d.get("content", "")
-        if any(k in c.lower() for k in keywords):
+        is_bowie = (uid in bowie_user_ids) or ("bowie" in dname) or ("โบวี่" in dname)
+        has_kw = any(k in c.lower() for k in keywords)
+        if is_bowie or has_kw:
             relevant_texts.append(c)
 
     if not relevant_texts:
@@ -485,9 +513,10 @@ def handle_dispatch_report_trigger(event):
     # 1. Build Flex Card Message
     flex_dict = build_dispatch_flex_card(records, start_th, end_th)
     
-    # 2. Build CSV Text Message
-    csv_content = format_records_to_csv(records)
-    csv_block = f"📄 **[CSV DATA สำหรับนำเข้า Excel]**\n```csv\n{csv_content[:3500]}\n```"
+    # 2. Check if user explicitly asked for CSV format
+    is_csv_requested = "csv" in text.lower()
+    csv_content = format_records_to_csv(records) if is_csv_requested else ""
+    csv_block = f"📄 **[CSV DATA สำหรับนำเข้า Excel]**\n```csv\n{csv_content[:3500]}\n```" if csv_content else ""
 
     # Send to LINE
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
@@ -496,18 +525,17 @@ def handle_dispatch_report_trigger(event):
         
         reply_messages = []
         
-        # Add Flex Message if valid
-        if flex_dict:
+        if is_csv_requested and csv_block:
+            reply_messages.append(TextMessage(text=csv_block))
+        elif flex_dict:
             try:
                 container = FlexContainer.from_dict(flex_dict)
                 flex_msg = FlexMessage(alt_text=f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th})", contents=container)
                 reply_messages.append(flex_msg)
             except Exception as e:
                 print(f"[FLEX CONTAINER ERROR]: {e}")
-                
-        # Add CSV text block as secondary bubble
-        if csv_content:
-            reply_messages.append(TextMessage(text=csv_block))
+                fallback_summary = f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th}) รวม {len(records)} รายการ"
+                reply_messages.append(TextMessage(text=fallback_summary))
             
         if not reply_messages:
             reply_messages.append(TextMessage(text=f"ℹ️ ประมวลผลเสร็จสิ้น พบ {len(records)} รายการ"))
@@ -519,11 +547,10 @@ def handle_dispatch_report_trigger(event):
             ))
         except Exception as err:
             print(f"[REPLY ERROR]: {err}. Trying text fallback.")
-            # Fallback to plain text
-            fallback_text = f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th}) รวม {len(records)} รายการ\n\n" + csv_block
+            fallback_text = f"🚚 สรุปการเดินรถ ({start_th} ถึง {end_th}) รวม {len(records)} รายการ"
             api.reply_message(ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=fallback_text[:4500])]
+                messages=[TextMessage(text=fallback_text)]
             ))
 
 def send_reply_text(reply_token: str, text: str, quote_token: str = None):
